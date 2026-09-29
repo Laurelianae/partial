@@ -20,6 +20,12 @@ def is_arch_supported(major: int, minor: int = 0) -> bool:
         return False
     return arch >= (major, minor)
 
+def is_arch(major: int, minor: int = 0) -> bool:
+    arch = _get_torch_cuda_version()
+    if arch is None:
+        return False
+    return arch == (major, minor)
+
 
 def is_sm90_supported() -> bool:
     return is_arch_supported(9, 0)
@@ -27,3 +33,6 @@ def is_sm90_supported() -> bool:
 
 def is_sm100_supported() -> bool:
     return is_arch_supported(10, 0)
+
+def is_sm121() -> bool:
+    return is_arch(12, 1)

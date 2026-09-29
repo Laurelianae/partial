@@ -16,6 +16,7 @@ from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_sup
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
 from .sample import BatchSamplingArgs, Sampler
+from ..utils.arch import is_sm121
 
 logger = init_logger(__name__)
 
@@ -220,7 +221,14 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     if config.attention_backend == "auto":
-        backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
+        if is_sm121():
+            backend = "fi"
+        elif is_sm100_supported():
+            backend = "trtllm"
+        elif is_sm90_supported():
+            backend = "fa,fi"
+        else:
+            backend = "fi"
         override("attention_backend", backend)
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
 
