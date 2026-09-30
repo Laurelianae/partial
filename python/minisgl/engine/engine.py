@@ -178,7 +178,7 @@ class Engine:
                     and (k.endswith("mlp.gate.weight") or k.endswith("e_score_correction_bias"))
                     else self.dtype
                 )
-                for k, v in load_weight(config.model_path, self.device)
+                for k, v in load_weight(config.model_path, self.device, dtype=self.dtype)
             }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
@@ -288,12 +288,6 @@ def _adjust_config(config: EngineConfig):
             raise ValueError("Quantized Naive checkpoints are not supported by the eager BF16 path")
         if config.dtype not in (torch.bfloat16, torch.float32):
             raise ValueError("Naive eager execution supports BF16 and FP32")
-        if config.tp_info.size > 1 and config.dtype != torch.float32:
-            override("dtype", torch.float32)
-            logger.warning_rank0(
-                "Naive TP correctness mode promotes weights and activations to FP32; "
-                "native BF16 TP is not yet qualified"
-            )
         override("attention_backend", "naive")
         override("cuda_graph_bs", [])
         override("cuda_graph_max_bs", 0)

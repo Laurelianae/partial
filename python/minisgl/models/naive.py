@@ -55,23 +55,60 @@ class NaiveLayerNorm(BaseOP):
         return F.layer_norm(x, (x.shape[-1],), self.weight, self.bias, 1e-5)
 
 
+def gather_last_dim(x: torch.Tensor, comm: DistributedCommunicator) -> torch.Tensor:
+    size = get_tp_info().size
+    if size == 1:
+        return x
+    gathered = comm.all_gather(x.contiguous()).view(size, x.shape[0], x.shape[1])
+    return gathered.transpose(0, 1).reshape(x.shape[0], size * x.shape[1])
+
+
+def output_shard_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Keep cuBLAS's full output shape without replicating other ranks' weights.
+
+    Merely retaining the full reduction dimension is insufficient: changing the
+    output dimension can also select a different BF16 reduction kernel. Temporary
+    zero rows preserve the reference GEMM shape and are discarded after the GEMM.
+    """
+    tp = get_tp_info()
+    if x.dtype != torch.bfloat16 or tp.size == 1:
+        return F.linear(x, weight, bias)
+    width = weight.shape[0]
+    before, after = tp.rank * width, (tp.size - tp.rank - 1) * width
+    padded = F.pad(weight, (0, 0, before, after))
+    padded_bias = None if bias is None else F.pad(bias, (before, after))
+    return F.linear(x, padded, padded_bias)[:, before : before + width].contiguous()
+
+
 class NaiveRowLinear(LinearOProj):
-    """Round once after combining TP dot products, rather than once per shard."""
+    """Shard output rows so BF16 dot products retain the reference's reduction size."""
+
+    def __init__(self, input_size: int, output_size: int, has_bias: bool) -> None:
+        self._output_sharded = torch.get_default_dtype() == torch.bfloat16
+        if self._output_sharded:
+            tp_size = get_tp_info().size
+            self._comm = DistributedCommunicator()
+            self._tp_size = tp_size
+            self.full_input_size, self.full_output_size = input_size, output_size
+            self.local_input_size = input_size
+            self.local_output_size = div_even(output_size, tp_size)
+            self.weight = torch.empty(self.local_output_size, input_size)
+            self.bias = torch.empty(self.local_output_size) if has_bias else None
+        else:
+            super().__init__(input_size, output_size, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._tp_size == 1:
-            return F.linear(x, self.weight, self.bias)
-        partial = F.linear(x.float(), self.weight.float())
-        return self._comm.all_reduce(partial).to(x.dtype)
+        if not self._output_sharded:
+            return super().forward(x)
+        x = gather_last_dim(x, self._comm)
+        return gather_last_dim(output_shard_linear(x, self.weight, self.bias), self._comm)
 
 
 class NaiveColumnLinear(LinearReplicated):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if get_tp_info().size == 1:
-            return F.linear(x, self.weight, self.bias)
-        return F.linear(
-            x.float(), self.weight.float(), None if self.bias is None else self.bias.float()
-        ).to(x.dtype)
+        return F.linear(x, self.weight, self.bias)
 
 
 class NaiveIndexer(BaseOP):
@@ -171,7 +208,16 @@ class NaiveExperts(BaseOP):
     def __init__(self, c: NaiveN05FlashConfig) -> None:
         width = div_even(c.moe_intermediate_size, get_tp_info().size)
         self.gate_up_proj = torch.empty(c.n_routed_experts, 2 * width, c.hidden_size)
-        self.down_proj = torch.empty(c.n_routed_experts, c.hidden_size, width)
+        self._output_sharded = torch.get_default_dtype() == torch.bfloat16
+        self.down_proj = (
+            torch.empty(
+                c.n_routed_experts,
+                div_even(c.hidden_size, get_tp_info().size),
+                c.moe_intermediate_size,
+            )
+            if self._output_sharded
+            else torch.empty(c.n_routed_experts, c.hidden_size, width)
+        )
         self._comm = DistributedCommunicator()
 
     def forward(
@@ -183,19 +229,18 @@ class NaiveExperts(BaseOP):
             slot, token = torch.where(selected.T == expert)
             if token.numel() == 0:
                 continue
-            if get_tp_info().size > 1:
-                gate_up = F.linear(states[token].float(), self.gate_up_proj[expert].float()).to(
-                    states.dtype
-                )
-            else:
-                gate_up = F.linear(states[token], self.gate_up_proj[expert])
+            gate_up = F.linear(states[token], self.gate_up_proj[expert])
             gate, up = gate_up.chunk(2, dim=-1)
             activated = F.silu(gate) * up
-            if get_tp_info().size > 1:
-                partial = F.linear(activated.float(), self.down_proj[expert].float())
-                out = self._comm.all_reduce(partial).to(states.dtype)
+            if self._output_sharded:
+                activated = gather_last_dim(activated, self._comm)
+                out = gather_last_dim(
+                    output_shard_linear(activated, self.down_proj[expert]), self._comm
+                )
             else:
                 out = F.linear(activated, self.down_proj[expert])
+                if get_tp_info().size > 1:
+                    out = self._comm.all_reduce(out)
             out = (out * weights[token, slot, None]).to(states.dtype)
             result.index_add_(0, token, out)
         return result

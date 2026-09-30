@@ -9,8 +9,8 @@ from serve import remote_command
 
 
 def main() -> int:
-    node, model, dtype = sys.argv[1:]
-    command = remote_command(int(node), model, ["--dtype", dtype], False)
+    node, model, dtype, *extra_args = sys.argv[1:]
+    command = remote_command(int(node), model, ["--dtype", dtype, *extra_args], False)
     worker = command.index("tools/serve_worker.py")
     command[worker + 1 : worker + 1] = ["--check-naive-parity"]
     return subprocess.call(command)

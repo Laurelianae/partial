@@ -61,5 +61,5 @@ serve-node node model *args: (sync node)
     @python3 tools/serve.py --node "$1" "$2" "${@:3}"
 
 # Run one side of Naive reference parity; invoke both nodes concurrently.
-naive-parity node model dtype="float32": (sync node)
-    @python3 tools/naive_parity_remote.py "$1" "$2" "$3"
+naive-parity node model dtype="float32" *args: (sync node)
+    @python3 tools/naive_parity_remote.py "$1" "$2" "$3" "${@:4}"

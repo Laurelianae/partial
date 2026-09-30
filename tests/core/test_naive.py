@@ -6,9 +6,16 @@ import pytest
 import torch
 from minisgl.attention.naive import attention, sparse_mask
 from minisgl.models.config import ModelConfig
-from minisgl.models.naive import NaiveRouter, rotary, round_indexer_fp8
+from minisgl.models.naive import (
+    NaiveRouter,
+    NaiveRowLinear,
+    gather_last_dim,
+    rotary,
+    round_indexer_fp8,
+)
 from minisgl.models.naive_config import NaiveN05FlashConfig
 from minisgl.models.weight import _load_naive_weight
+from minisgl.utils import torch_dtype
 from safetensors.torch import save_file
 
 
@@ -34,12 +41,14 @@ def test_invalid_config():
         config(attention_chunk_size=0)
 
 
-def test_naive_tp_correctness_settings(monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_naive_tp_correctness_settings(monkeypatch, dtype, tp_size):
     import minisgl.distributed.info as distributed_info
     from minisgl.distributed import DistributedInfo
     from minisgl.engine.engine import _adjust_config
 
-    monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(0, 2))
+    monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(0, tp_size))
     c = config()
     settings = SimpleNamespace(
         model_config=ModelConfig.from_hf(c),
@@ -47,13 +56,13 @@ def test_naive_tp_correctness_settings(monkeypatch):
         attention_backend="auto",
         moe_backend="auto",
         use_dummy_weight=False,
-        dtype=torch.bfloat16,
-        tp_info=SimpleNamespace(size=2),
+        dtype=dtype,
+        tp_info=SimpleNamespace(size=tp_size),
         cuda_graph_bs=[1, 2],
         cuda_graph_max_bs=2,
     )
     _adjust_config(settings)
-    assert settings.dtype == torch.float32
+    assert settings.dtype == dtype
     assert settings.attention_backend == "naive"
     assert settings.cuda_graph_bs == [] and settings.cuda_graph_max_bs == 0
     settings.attention_backend = "fi"
@@ -127,8 +136,9 @@ def test_router_bias_changes_choices_but_not_weights():
     torch.testing.assert_close(weights, torch.ones_like(weights))
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("packed", [False, True])
-def test_naive_loader_shards_layer_heads_and_experts(tmp_path, monkeypatch, packed):
+def test_naive_loader_shards_layer_heads_and_experts(tmp_path, monkeypatch, packed, dtype):
     import minisgl.models.weight as loader
 
     c = ModelConfig.from_hf(
@@ -147,6 +157,8 @@ def test_naive_loader_shards_layer_heads_and_experts(tmp_path, monkeypatch, pack
         .float(),
         "model.layers.0.self_attn.indexer.wq.weight": torch.ones(16 * 128, 4),
         "model.layers.1.mlp.gate.weight": torch.ones(2, 4),
+        "model.layers.0.self_attn.o_proj.weight": torch.arange(16).reshape(4, 4).float(),
+        "model.layers.0.mlp.down_proj.weight": torch.arange(16).reshape(4, 4).float(),
     }
     prefix = "model.layers.1.mlp.experts."
     if packed:
@@ -158,7 +170,7 @@ def test_naive_loader_shards_layer_heads_and_experts(tmp_path, monkeypatch, pack
                 tensors[f"{prefix}{i}.{name}_proj.weight"] = value[i].contiguous()
     file = tmp_path / "weights.safetensors"
     save_file(tensors, str(file))
-    result = dict(_load_naive_weight([str(file)], c, torch.device("cpu")))
+    result = dict(_load_naive_weight([str(file)], c, torch.device("cpu"), dtype=dtype))
     assert result["model.layers.0.self_attn.k_proj.weight"].shape == (2 * 192, 4)
     assert result["model.layers.1.self_attn.k_proj.weight"].shape == (4 * 192, 4)
     assert result["model.layers.0.self_attn.indexer.wq.weight"].shape == (16 * 128, 4)
@@ -166,4 +178,66 @@ def test_naive_loader_shards_layer_heads_and_experts(tmp_path, monkeypatch, pack
     torch.testing.assert_close(
         result[prefix + "gate_up_proj"], torch.cat((gate[:, 2:], up[:, 2:]), 1)
     )
-    torch.testing.assert_close(result[prefix + "down_proj"], down[:, :, 2:])
+    torch.testing.assert_close(
+        result[prefix + "down_proj"], down[:, 2:, :] if dtype == torch.bfloat16 else down[:, :, 2:]
+    )
+    for name in ("model.layers.0.self_attn.o_proj.weight", "model.layers.0.mlp.down_proj.weight"):
+        expected = tensors[name][2:, :] if dtype == torch.bfloat16 else tensors[name][:, 2:]
+        torch.testing.assert_close(result[name], expected)
+
+
+@pytest.mark.parametrize("size", [1, 2, 4])
+def test_gather_last_dim_preserves_token_and_rank_order(monkeypatch, size):
+    import minisgl.models.naive as naive
+
+    monkeypatch.setattr(naive, "get_tp_info", lambda: SimpleNamespace(rank=0, size=size))
+    full = torch.arange(3 * 2 * size).reshape(3, 2 * size)
+    shards = full.chunk(size, dim=-1)
+
+    class Communicator:
+        def all_gather(self, value):
+            assert value.is_contiguous()
+            assert torch.equal(value, shards[0])
+            return torch.cat(shards, dim=0)
+
+    assert torch.equal(gather_last_dim(shards[0], Communicator()), full)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="BF16 GEMM regression requires CUDA")
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("tokens", [1, 13, 127])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_bf16_tp_output_projection_matches_unsharded_gemm(monkeypatch, rank, tokens, has_bias):
+    import minisgl.models.naive as naive
+
+    monkeypatch.setattr(naive, "get_tp_info", lambda: SimpleNamespace(rank=rank, size=2))
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    states = torch.randn(tokens, 1024, device="cuda", generator=generator).bfloat16()
+    weight = (torch.randn(256, 1024, device="cuda", generator=generator) * 0.02).bfloat16()
+    bias = torch.randn(256, device="cuda", generator=generator).bfloat16() if has_bias else None
+    expected = torch.nn.functional.linear(states, weight, bias)
+    inputs, outputs = states.chunk(2, dim=-1), expected.chunk(2, dim=-1)
+    with torch_dtype(torch.bfloat16):
+        projection = NaiveRowLinear(1024, 256, has_bias)
+    projection.weight = weight.chunk(2, dim=0)[rank].contiguous()
+    projection.bias = None if bias is None else bias.chunk(2)[rank].contiguous()
+
+    class Communicator:
+        calls = 0
+
+        def all_gather(self, value):
+            self.calls += 1
+            if self.calls == 1:
+                assert torch.equal(value, inputs[rank])
+                return torch.cat(inputs, dim=0)
+            torch.testing.assert_close(value, outputs[rank], atol=0, rtol=0)
+            shards = list(outputs)
+            shards[rank] = value
+            return torch.cat(shards, dim=0)
+
+    projection._comm = Communicator()
+    actual = projection.forward(inputs[rank])
+    assert projection.weight.dtype == actual.dtype == torch.bfloat16
+    assert projection.weight.numel() == weight.numel() // 2
+    assert projection._comm.calls == 2
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

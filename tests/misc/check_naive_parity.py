@@ -43,7 +43,7 @@ def main() -> None:
             max_running_req=4,
         )
     )
-    dtype = engine.dtype
+    assert engine.dtype == dtype, f"Requested {dtype}, but engine uses {engine.dtype}"
     reference = load_reference(args.model, dtype, engine.device)
     max_error = 0.0
     max_relative_l2 = 0.0

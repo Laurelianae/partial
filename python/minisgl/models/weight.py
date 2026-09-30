@@ -72,9 +72,13 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
     return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
 
 
-def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
+def load_weight(
+    model_path: str, device: torch.device, *, dtype: torch.dtype | None = None
+) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
-    and on device. Peak CPU memory: one full tensor + a small merge buffer."""
+    and on device. Peak CPU memory: one full tensor + a small merge buffer.
+    The execution dtype selects Naive's BF16 output-row sharding; it does not cast weights.
+    """
     from .config import ModelConfig
 
     model_folder = download_hf_weight(model_path)
@@ -84,7 +88,7 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     tp_info = get_tp_info()
 
     if config.is_naive:
-        yield from _load_naive_weight(files, config, device)
+        yield from _load_naive_weight(files, config, device, dtype=dtype)
         return
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
@@ -128,7 +132,7 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     assert not expert_buf, f"Incomplete expert tensors in checkpoint: {list(expert_buf.keys())}"
 
 
-def _load_naive_weight(files, config, device):
+def _load_naive_weight(files, config, device, *, dtype: torch.dtype | None = None):
     """Naive keeps split attention/dense projections and packs only expert matrices."""
     c = config.naive_config
     assert c is not None
@@ -143,7 +147,11 @@ def _load_naive_weight(files, config, device):
             gate, up = tensor.chunk(2, dim=1)
             return torch.cat((gate.chunk(size, dim=1)[rank], up.chunk(size, dim=1)[rank]), dim=1)
         if name.endswith(".experts.down_proj"):
-            return tensor.chunk(size, dim=2)[rank]
+            return tensor.chunk(size, dim=1 if dtype == torch.bfloat16 else 2)[rank]
+        if dtype == torch.bfloat16 and name.endswith(
+            (".o_proj.weight", ".o_proj.bias", ".down_proj.weight", ".down_proj.bias")
+        ):
+            return tensor.chunk(size, dim=0)[rank]
         if ".indexer." in name or ".mlp.gate." in name:
             return tensor
         if name.endswith(".attention_sink_bias"):
