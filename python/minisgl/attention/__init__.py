@@ -19,6 +19,15 @@ class BackendCreator(Protocol):
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("naive")
+def create_naive_backend(config: ModelConfig):
+    from .naive import NaiveAttentionBackend
+
+    if not config.is_naive:
+        raise ValueError("The naive attention backend requires NaiveN05FlashForCausalLM")
+    return NaiveAttentionBackend(config)
+
+
 @SUPPORTED_ATTENTION_BACKENDS.register("trtllm")
 def create_trtllm_backend(config: ModelConfig):
     from .trtllm import TensorRTLLMBackend

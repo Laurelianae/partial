@@ -16,6 +16,7 @@ class DisabledTqdm(tqdm):
 
 
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
+    _register_naive_config()
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     # Some Mistral models store chat_template in a separate JSON file
     if not getattr(tokenizer, "chat_template", None):
@@ -29,7 +30,15 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
 
 
 @functools.cache
+def _register_naive_config() -> None:
+    from minisgl.models.naive_config import NaiveN05FlashConfig
+
+    AutoConfig.register("naive_n05_flash", NaiveN05FlashConfig, exist_ok=True)
+
+
+@functools.cache
 def _load_hf_config(model_path: str) -> Any:
+    _register_naive_config()
     return AutoConfig.from_pretrained(model_path)
 
 

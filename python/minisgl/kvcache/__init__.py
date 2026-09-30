@@ -31,6 +31,10 @@ def create_kvcache_pool(
     dtype: torch.dtype,
     device: torch.device,
 ) -> BaseKVCachePool:
+    if model_config.is_naive:
+        from .naive_pool import NaiveKVCache
+
+        return NaiveKVCache(model_config, num_pages, page_size, dtype, device)
     from .mha_pool import MHAKVCache  # TODO: support other variants (e.g. MLA)
 
     return MHAKVCache(

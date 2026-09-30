@@ -16,6 +16,9 @@ def main() -> int:
     watch_stdin = server_args[:1] == ["--watch-stdin"]
     if watch_stdin:
         server_args = server_args[1:]
+    parity = server_args[:1] == ["--check-naive-parity"]
+    if parity:
+        server_args = server_args[1:]
     # SSH does not activate the venv. JIT builds still need its ninja executable on PATH.
     os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]
     stopping = threading.Event()
@@ -23,7 +26,11 @@ def main() -> int:
     signal.signal(signal.SIGINT, lambda *_: stopping.set())
 
     process = subprocess.Popen(
-        [sys.executable, "-m", "minisgl", *server_args],
+        (
+            [sys.executable, "tests/misc/check_naive_parity.py", *server_args]
+            if parity
+            else [sys.executable, "-m", "minisgl", *server_args]
+        ),
         start_new_session=True,
         stdin=subprocess.DEVNULL if watch_stdin else None,
     )

@@ -11,7 +11,7 @@ from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
 from minisgl.moe import create_moe_backend
-from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
+from minisgl.utils import init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
 from ..utils.arch import is_sm121
 from .config import EngineConfig
@@ -32,6 +32,7 @@ class Engine:
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)
+        self.model_config = config.model_config
 
         self.device = torch.device(f"cuda:{config.gpu_index}")
         self.tp_info = config.tp_info
@@ -90,7 +91,7 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
-        if config.model_config.is_moe:
+        if config.model_config.is_moe and not config.model_config.is_naive:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
         # ======================= Sampler initialization ========================
@@ -170,18 +171,22 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+            return {
+                k: v.to(
+                    torch.float32
+                    if config.model_config.is_naive
+                    and (k.endswith("mlp.gate.weight") or k.endswith("e_score_correction_bias"))
+                    else self.dtype
+                )
+                for k, v in load_weight(config.model_path, self.device)
+            }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         memory_range = self._sync_get_memory()
         new_free_memory = memory_range[0 if self.multi_node else 1]
         cache_per_page = (
-            2  # key + value
-            * config.model_config.head_dim
-            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
+            config.model_config.kv_bytes_per_token(config.tp_info.size, self.dtype.itemsize)
             * config.page_size
-            * self.dtype.itemsize
-            * config.model_config.num_layers
         )
         num_pages = config.num_page_override
         if num_pages is None:
@@ -271,6 +276,29 @@ def _align_up_32(num: int) -> int:
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
+
+    if config.model_config.is_naive:
+        if config.attention_backend not in ("auto", "naive"):
+            raise ValueError("Naive requires the eager 'naive' attention backend")
+        if config.moe_backend != "auto":
+            raise ValueError("Naive uses its own eager sigmoid MoE implementation")
+        if config.use_dummy_weight:
+            raise ValueError("Use tools/make_naive_fixture.py instead of --dummy-weight for Naive")
+        if getattr(config.hf_config, "quantization_config", None):
+            raise ValueError("Quantized Naive checkpoints are not supported by the eager BF16 path")
+        if config.dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError("Naive eager execution supports BF16 and FP32")
+        if config.tp_info.size > 1 and config.dtype != torch.float32:
+            override("dtype", torch.float32)
+            logger.warning_rank0(
+                "Naive TP correctness mode promotes weights and activations to FP32; "
+                "native BF16 TP is not yet qualified"
+            )
+        override("attention_backend", "naive")
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+        logger.info_rank0("Naive eager execution: CUDA graphs and overlap scheduling disabled")
+        return
 
     if config.attention_backend == "auto":
         if is_sm121():

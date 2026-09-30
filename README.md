@@ -183,4 +183,5 @@ python3 -m sglang.launch_server --model "Qwen/Qwen3-32B" --tp 4 \
 ## 📚 Learn More
 
 - **[Detailed Features](./docs/features.md)**: Explore all available features and command-line arguments.
+- **[Naive-N0.5-Flash](./docs/naive.md)**: Generate a synthetic checkpoint and validate the eager implementation on the Sparks.
 - **[System Architecture](./docs/structures.md)**: Dive deep into the design and data flow of Mini-SGLang.

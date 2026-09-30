@@ -322,7 +322,7 @@ def test_cache_uses_local_memory_budget_then_the_smallest_peer_page_count(monkey
         memory_ratio=0.9,
         page_size=1,
         tp_info=DistributedInfo(0, 2),
-        model_config=SimpleNamespace(head_dim=1, num_kv_heads=2, num_layers=1),
+        model_config=SimpleNamespace(kv_bytes_per_token=lambda tp_size, itemsize: 2 * itemsize),
     )
 
     def reduce_pages(pages, op, group):

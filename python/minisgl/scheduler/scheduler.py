@@ -119,7 +119,7 @@ class Scheduler(SchedulerIOMixin):
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.engine.model_config.is_naive:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:

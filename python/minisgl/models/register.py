@@ -3,6 +3,7 @@ import importlib
 from .config import ModelConfig
 
 _MODEL_REGISTRY = {
+    "NaiveN05FlashForCausalLM": (".naive", "NaiveN05FlashForCausalLM"),
     "LlamaForCausalLM": (".llama", "LlamaForCausalLM"),
     "Qwen2ForCausalLM": (".qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": (".qwen3", "Qwen3ForCausalLM"),

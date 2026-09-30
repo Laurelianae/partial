@@ -83,6 +83,10 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
 
+    if config.is_naive:
+        yield from _load_naive_weight(files, config, device)
+        return
+
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
@@ -122,3 +126,80 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
 
     assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
     assert not expert_buf, f"Incomplete expert tensors in checkpoint: {list(expert_buf.keys())}"
+
+
+def _load_naive_weight(files, config, device):
+    """Naive keeps split attention/dense projections and packs only expert matrices."""
+    c = config.naive_config
+    assert c is not None
+    if getattr(c, "quantization_config", None):
+        raise ValueError("Quantized Naive checkpoints are not supported yet")
+    rank, size = get_tp_info().rank, get_tp_info().size
+    experts = {}
+    packed_parts = {}
+
+    def shard(name, tensor):
+        if name.endswith(".experts.gate_up_proj"):
+            gate, up = tensor.chunk(2, dim=1)
+            return torch.cat((gate.chunk(size, dim=1)[rank], up.chunk(size, dim=1)[rank]), dim=1)
+        if name.endswith(".experts.down_proj"):
+            return tensor.chunk(size, dim=2)[rank]
+        if ".indexer." in name or ".mlp.gate." in name:
+            return tensor
+        if name.endswith(".attention_sink_bias"):
+            return tensor.chunk(size)[rank]
+        if ".self_attn." in name:
+            layer = int(name.split(".layers.")[1].split(".")[0])
+            prefix = "swa_" if c.hybrid_layer_pattern[layer] else ""
+            heads = getattr(c, prefix + "num_key_value_heads")
+            return _shard_tensor(name, tensor, rank, size, heads)
+        return _shard_tensor(name, tensor, rank, size, c.num_key_value_heads)
+
+    def output(name, tensor):
+        dtype = (
+            torch.float32
+            if name.endswith((".mlp.gate.weight", ".e_score_correction_bias"))
+            else tensor.dtype
+        )
+        return name, shard(name, tensor).contiguous().to(device=device, dtype=dtype)
+
+    def pack(name, tensor):
+        # Transformers 5 checkpoints can store already-packed experts without .weight.
+        if ".experts." in name and tensor.ndim == 3:
+            name = name.removesuffix(".weight")
+            if name.endswith((".gate_proj", ".up_proj")):
+                prefix, projection = name.rsplit(".", 1)
+                parts = packed_parts.setdefault(prefix, {})
+                parts[projection] = tensor
+                if len(parts) == 2:
+                    del packed_parts[prefix]
+                    return output(
+                        prefix + ".gate_up_proj",
+                        torch.cat((parts["gate_proj"], parts["up_proj"]), 1),
+                    )
+                return None
+        return output(name, tensor)
+
+    for file in sorted(files):
+        with safetensors.safe_open(file, framework="pt", device="cpu") as reader:
+            for name in reader.keys():
+                tensor = reader.get_tensor(name)
+                if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) or "scale_inv" in name:
+                    raise ValueError("Quantized Naive weights require a quantized loader")
+                match = _EXPERT_PATTERN.match(name)
+                if match:
+                    prefix = match.group("prefix")
+                    projection = match.group("name").removesuffix(".weight")
+                    key = prefix + "." + projection
+                    parts = experts.setdefault(key, {})
+                    parts[int(match.group("idx"))] = tensor
+                    if len(parts) != c.n_routed_experts:
+                        continue
+                    tensor = torch.stack([parts[i] for i in range(c.n_routed_experts)])
+                    del experts[key]
+                    name = key
+                result = pack(name, tensor)
+                if result is not None:
+                    yield result
+    if experts or packed_parts:
+        raise ValueError("Incomplete Naive expert tensors in checkpoint")
