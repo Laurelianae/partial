@@ -1,46 +1,53 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+set positional-arguments
+set dotenv-path := ".env.local"
+set dotenv-required
 
-remote := env_var_or_default("PARTIAL_REMOTE", env_var("SPARK_ADDRESS"))
-remote_user := env_var_or_default("PARTIAL_USER", env_var("USER"))
-ssh_target := remote_user + "@" + remote
+# List available commands.
+default:
+    @just --list
 
-remote_dir := env_var_or_default(
-    "PARTIAL_REMOTE_DIR",
-    "~/Development/Projects/partial",
-)
+# Create the dedicated remote project directory.
+# Does not install Python or create a venv.
+init node="0":
+    @bash tools/remote.sh "$1" init
 
-sync:
-    ./tools/sync.sh
+# Synchronize source to one node.
+sync node="0":
+    @bash tools/remote.sh "$1" sync
 
-shell: sync
-    ssh -t {{ssh_target}} \
-        'cd {{remote_dir}} && exec bash --rcfile <(printf "%s\n" "source ~/.bashrc" "source .venv/bin/activate") -i'
+# Preview changes and deletions without applying them.
+sync-dry node="0":
+    @bash tools/remote.sh "$1" sync --dry-run
 
-check-remote: sync
-    ssh {{ssh_target}} \
-        'cd {{remote_dir}} && .venv/bin/python -c "import minisgl; print(\"Mini-SGLang import OK\")"'
+# Synchronize both nodes.
+sync-all: (sync "0") (sync "1")
 
-doctor: sync
-    ssh {{ssh_target}} 'cd {{remote_dir}} && \
-        source .venv/bin/activate && \
-        python -c "import torch; \
-        print(\"torch:\", torch.__version__); \
-        print(\"cuda:\", torch.version.cuda); \
-        print(\"available:\", torch.cuda.is_available()); \
-        print(\"device:\", torch.cuda.get_device_name(0) if torch.cuda.is_available() else None); \
-        print(\"capability:\", torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None)"'
+# Open Bash with the venv and its prompt decoration enabled.
+shell node="0": (sync node)
+    @bash tools/remote.sh "$1" shell
 
-smoke: sync
-    ssh -t {{ssh_target}} 'cd {{remote_dir}} && \
-        source .venv/bin/activate && \
-        python -m minisgl \
-            --model Qwen/Qwen3-0.6B \
-            --shell'
+# Locate the Mini-SGLang entry point in the remote environment.
+check-remote node="0": (sync node)
+    @bash tools/remote.sh "$1" exec .venv/bin/python -c \
+        'import importlib.util; spec = importlib.util.find_spec("minisgl.__main__"); assert spec is not None and spec.origin is not None, "Cannot locate minisgl.__main__"; print("Mini-SGLang entry point:", spec.origin)'
 
-serve-smoke: sync
-    ssh -t {{ssh_target}} 'cd {{remote_dir}} && \
-        source .venv/bin/activate && \
-        python -m minisgl \
-            --model Qwen/Qwen3-0.6B \
-            --host 0.0.0.0 \
-            --port 1919'
+check-all: (check-remote "0") (check-remote "1")
+
+# Check Python, PyTorch, and a small CUDA calculation on one node.
+doctor node="0": (sync node)
+    @bash tools/remote.sh "$1" exec .venv/bin/python tools/doctor.py
+
+doctor-all: (doctor "0") (doctor "1")
+
+# Execute a command inside the remote project directory.
+run node +args: (sync node)
+    @bash tools/remote.sh "$1" exec "${@:2}"
+
+# Launch ONE side of the distributed connectivity test.
+dist-smoke node: (sync node)
+    @bash tools/remote.sh "$1" exec .venv/bin/python -m torch.distributed.run \
+        --nnodes=2 --nproc-per-node=1 --node-rank="$1" \
+        --master-addr="${PARTIAL_MASTER_ADDR:?Set PARTIAL_MASTER_ADDR in .env.local}" \
+        --master-port="${PARTIAL_MASTER_PORT:-29500}" \
+        tools/distributed_smoke.py

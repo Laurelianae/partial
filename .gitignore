@@ -33,3 +33,5 @@ env/
 .coverage
 
 .idea/
+
+.env.local
