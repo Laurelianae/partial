@@ -400,12 +400,7 @@ async def shell():
         print("Exiting shell...")
         await asyncio.sleep(0.1)
         get_global_state().shutdown()
-        # then kill all the subprocesses
-        import psutil
-
-        parent = psutil.Process()
-        for child in parent.children(recursive=True):
-            child.kill()
+        # launch_server owns worker cleanup, including the scheduler on the other Spark.
 
 
 def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_shell: bool) -> None:
@@ -447,6 +442,6 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
 
     logger.info(f"API server is ready to serve on {host}:{port}")
     if not run_shell:
-        uvicorn.run(app, host=host, port=port)
+        uvicorn.run(app, host=host, port=port, timeout_graceful_shutdown=5)
     else:
         asyncio.run(shell())

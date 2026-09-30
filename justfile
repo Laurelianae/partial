@@ -51,3 +51,11 @@ dist-smoke node: (sync node)
         --master-addr="${PARTIAL_MASTER_ADDR:?Set PARTIAL_MASTER_ADDR in .env.local}" \
         --master-port="${PARTIAL_MASTER_PORT:-29500}" \
         tools/distributed_smoke.py
+
+# Serve one model across both Sparks; Ctrl-C stops both nodes.
+serve-two model *args: sync-all
+    @python3 tools/serve.py "$1" "${@:2}"
+
+# Start one side in a separate terminal for debugging.
+serve-node node model *args: (sync node)
+    @python3 tools/serve.py --node "$1" "$2" "${@:3}"

@@ -13,10 +13,10 @@ from minisgl.models import create_model, load_weight
 from minisgl.moe import create_moe_backend
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
+from ..utils.arch import is_sm121
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
 from .sample import BatchSamplingArgs, Sampler
-from ..utils.arch import is_sm121
 
 logger = init_logger(__name__)
 
@@ -33,7 +33,9 @@ class Engine:
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)
 
-        self.device = torch.device(f"cuda:{config.tp_info.rank}")
+        self.device = torch.device(f"cuda:{config.gpu_index}")
+        self.tp_info = config.tp_info
+        self.multi_node = config.nnodes > 1
         torch.cuda.set_device(self.device)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
@@ -43,7 +45,18 @@ class Engine:
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
-        init_free_memory = self._sync_get_memory()[1]
+        if self.multi_node:
+            from minisgl.distributed.check import check_matching_settings
+
+            settings = [{} for _ in range(config.tp_info.size)]
+            torch.distributed.all_gather_object(
+                settings, config.shared_inference_settings(), group=self.tp_cpu_group
+            )
+            check_matching_settings(settings)
+        # Every worker must select the same graph sizes and a cache that fits all nodes.
+        initial_memory_range = self._sync_get_memory()
+        self.initial_local_free_memory = self.local_free_memory
+        init_free_memory = initial_memory_range[0 if self.multi_node else 1]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
@@ -109,9 +122,15 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
         )
+        if self.multi_node:
+            # Weight loading and JIT compilation use the startup deadline. Once ready,
+            # request coordination gets its shorter runtime failure-detection timeout.
+            self.tp_cpu_group = torch.distributed.new_group(
+                backend="gloo", timeout=timedelta(seconds=config.distributed_timeout)
+            )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
+        if config.tp_info.size == 1 or (config.use_pynccl and not self.multi_node):
             torch.distributed.init_process_group(
                 backend="gloo",
                 rank=config.tp_info.rank,
@@ -133,7 +152,14 @@ class Engine:
                 timeout=timedelta(seconds=config.distributed_timeout),
                 init_method=config.distributed_addr,
             )
-            tp_cpu_group = torch.distributed.new_group(backend="gloo")
+            tp_cpu_group = torch.distributed.new_group(
+                backend="gloo",
+                timeout=timedelta(
+                    seconds=(
+                        config.startup_timeout if self.multi_node else config.distributed_timeout
+                    )
+                ),
+            )
             assert tp_cpu_group is not None
         return tp_cpu_group
 
@@ -147,7 +173,8 @@ class Engine:
             return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
-        new_free_memory = self._sync_get_memory()[1]
+        memory_range = self._sync_get_memory()
+        new_free_memory = memory_range[0 if self.multi_node else 1]
         cache_per_page = (
             2  # key + value
             * config.model_config.head_dim
@@ -158,9 +185,23 @@ class Engine:
         )
         num_pages = config.num_page_override
         if num_pages is None:
-            model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            if self.multi_node:
+                # Compute each host's budget locally, then choose the smallest page count.
+                model_memory = self.initial_local_free_memory - self.local_free_memory
+                available_memory = (
+                    int(config.memory_ratio * self.initial_local_free_memory) - model_memory
+                )
+            else:
+                model_memory = old_free_memory - new_free_memory
+                available_memory = int(config.memory_ratio * old_free_memory) - model_memory
             num_pages = available_memory // cache_per_page
+
+        if self.multi_node:
+            pages = torch.tensor(num_pages, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                pages, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            )
+            num_pages = int(pages.item())
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
         num_tokens = num_pages * config.page_size
@@ -174,6 +215,7 @@ class Engine:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
         free_memory = get_free_memory(self.device)
+        self.local_free_memory = free_memory
         free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
         torch.distributed.all_reduce(
             free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
@@ -181,11 +223,13 @@ class Engine:
         min_free_memory = int(free_mem_tensor[0].item())
         max_free_memory = -int(free_mem_tensor[1].item())
         if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
-            logger.error(
+            log = logger.warning if self.multi_node else logger.error
+            log(
                 f"Memory across TP ranks are imbalanced:"
                 f" min {mem_GB(min_free_memory)}, max {mem_GB(max_free_memory)}"
             )
-            raise RuntimeError("Memory across TP ranks are imbalanced")
+            if not self.multi_node:
+                raise RuntimeError("Memory across TP ranks are imbalanced")
 
         return min_free_memory, max_free_memory
 
@@ -200,7 +244,15 @@ class Engine:
         for req in batch.reqs:
             req.complete_one()
 
-        next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+        if self.multi_node:
+            if self.tp_info.is_primary():
+                next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+            else:
+                next_tokens_gpu = torch.empty(batch.size, dtype=torch.int32, device=self.device)
+            # One sampling decision keeps request completion and future batches identical.
+            torch.distributed.broadcast(next_tokens_gpu, src=0)
+        else:
+            next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

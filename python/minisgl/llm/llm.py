@@ -27,6 +27,10 @@ class RequestStatus:
 
 class LLM(Scheduler):
     def __init__(self, model_path: str, dtype: torch.dtype = torch.bfloat16, **kwargs):
+        if kwargs.get("nnodes", 1) != 1:
+            raise ValueError(
+                "The LLM Python interface is single-node; use the server for two Sparks"
+            )
         config = SchedulerConfig(
             model_path=model_path,
             tp_info=DistributedInfo(0, 1),

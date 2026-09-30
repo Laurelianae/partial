@@ -25,6 +25,11 @@ class EngineConfig:
     page_size: int = 1
     memory_ratio: float = 0.9
     distributed_timeout: float = 60.0
+    startup_timeout: float = 600.0
+    # TP rank selects a model shard; local GPU index selects a device on this host.
+    local_gpu_index: int | None = None
+    nnodes: int = 1
+    dist_init_addr: str | None = None
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
@@ -52,4 +57,39 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
+        if self.dist_init_addr is not None:
+            return f"tcp://{self.dist_init_addr}"
         return "tcp://127.0.0.1:2333"
+
+    @property
+    def gpu_index(self) -> int:
+        return self.tp_info.rank if self.local_gpu_index is None else self.local_gpu_index
+
+    def shared_inference_settings(self) -> dict[str, object]:
+        """Settings that must agree so all TP workers execute the same operations."""
+        names = (
+            "model_path",
+            "dtype",
+            "max_running_req",
+            "attention_backend",
+            "moe_backend",
+            "cuda_graph_bs",
+            "cuda_graph_max_bs",
+            "page_size",
+            "memory_ratio",
+            "use_dummy_weight",
+            "use_pynccl",
+            "max_seq_len_override",
+            "num_page_override",
+            "distributed_timeout",
+            "startup_timeout",
+        )
+        settings = {name: getattr(self, name) for name in names}
+        settings["dtype"] = str(self.dtype)
+        settings["model_config"] = self.hf_config.to_dict()
+        settings["model_revision"] = getattr(self.hf_config, "_commit_hash", None)
+        from minisgl.env import ENV
+
+        settings["disable_overlap_scheduling"] = ENV.DISABLE_OVERLAP_SCHEDULING.value
+        settings["flashinfer_use_tensor_cores"] = ENV.FLASHINFER_USE_TENSOR_CORES.value
+        return settings

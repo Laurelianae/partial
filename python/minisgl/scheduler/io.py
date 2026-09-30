@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final, List
 
+import msgpack
 import torch
 from minisgl.message import BaseBackendMsg, BaseTokenizerMsg, BatchTokenizerMsg, DetokenizeMsg
 from minisgl.utils import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue, init_logger
@@ -27,6 +28,7 @@ class SchedulerIOMixin:
     def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
         tp_info = config.tp_info
         self.tp_cpu_group: Final = tp_cpu_group
+        self._is_primary = tp_info.is_primary()
         if config.offline_mode:
             self.receive_msg = self.offline_receive_msg
             self.send_result = self.offline_send_result
@@ -46,7 +48,11 @@ class SchedulerIOMixin:
 
         recv = self._recv_msg_single_rank
         send = self._reply_tokenizer_rank0
-        if tp_info.size > 1:
+        if config.nnodes > 1:
+            recv = self._recv_msg_multi_node
+            if not tp_info.is_primary():
+                send = self._reply_tokenizer_rank1
+        elif tp_info.size > 1:
             if tp_info.is_primary():
                 recv = self._recv_msg_multi_rank0
                 self._send_into_ranks: Final = ZmqPubQueue(
@@ -105,6 +111,19 @@ class SchedulerIOMixin:
             self._send_into_ranks.put_raw(raw)
             pending_msgs.append(self._recv_from_tokenizer.decode(raw))
         return pending_msgs
+
+    def _recv_msg_multi_node(self, blocking: bool = False) -> List[BaseBackendMsg]:
+        """Broadcast one ordered batch, including empty batches while the server is idle."""
+        raw_messages = []
+        if self._is_primary:
+            if blocking:
+                # Do not block indefinitely: the peer must keep entering CPU collectives.
+                self._recv_from_tokenizer.socket.poll(timeout=100)
+            while not self._recv_from_tokenizer.empty():
+                raw_messages.append(self._recv_from_tokenizer.get_raw())
+        payload = [raw_messages]
+        torch.distributed.broadcast_object_list(payload, src=0, group=self.tp_cpu_group)
+        return [BaseBackendMsg.decoder(msgpack.unpackb(raw, raw=False)) for raw in payload[0]]
 
     def _recv_msg_multi_rank1(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []

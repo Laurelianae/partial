@@ -17,6 +17,14 @@ class SchedulerConfig(EngineConfig):
     cache_type: str = "radix"
     offline_mode: bool = False
 
+    def shared_inference_settings(self) -> dict[str, object]:
+        return {
+            **super().shared_inference_settings(),
+            "max_extend_tokens": self.max_extend_tokens,
+            "cache_type": self.cache_type,
+            "offline_mode": self.offline_mode,
+        }
+
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)
 

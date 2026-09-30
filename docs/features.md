@@ -18,6 +18,10 @@ python -m minisgl --model "Qwen/Qwen3-0.6B" --shell
 
 To scale performance across multiple GPUs, Mini-SGLang supports Tensor Parallelism (TP). You can enable distributed serving by specifying the number of GPUs with the `--tp n` argument, where `n` is the degree of parallelism.
 
+For two Sparks, `just serve-two MODEL` launches one TP worker on each machine and serves
+the API on node 0. See [two-Spark serving](two-sparks.md) for setup, the process diagram,
+and validation commands.
+
 ## Supported Models
 
 Our framework currently supports the following dense model architectures:

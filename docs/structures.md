@@ -15,6 +15,10 @@ Mini-SGLang is designed as a distributed system to handle Large Language Model (
 
 The components communicate using **ZeroMQ (ZMQ)** for control messages and **NCCL** (via `torch.distributed`) for heavy tensor data exchange between GPUs.
 
+In the two-Spark setup, ZMQ stays local to node 0, and scheduler request batches travel
+between nodes through Gloo. See [two-Spark serving](two-sparks.md) for the cross-node
+process diagram and a glossary of distributed terms.
+
 ![Process overview diagram](https://lmsys.org/images/blog/minisgl/design.drawio.png)
 
 **Request Lifecycle:**

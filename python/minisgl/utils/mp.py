@@ -26,7 +26,7 @@ class ZmqPushQueue(Generic[T]):
         self.socket.send(event, copy=False)
 
     def stop(self):
-        self.socket.close()
+        self.socket.close(linger=0)
         self.context.term()
 
 
@@ -47,7 +47,7 @@ class ZmqAsyncPushQueue(Generic[T]):
         await self.socket.send(event, copy=False)
 
     def stop(self):
-        self.socket.close()
+        self.socket.close(linger=0)
         self.context.term()
 
 
@@ -77,7 +77,7 @@ class ZmqPullQueue(Generic[T]):
         return self.socket.poll(timeout=0) == 0
 
     def stop(self):
-        self.socket.close()
+        self.socket.close(linger=0)
         self.context.term()
 
 
@@ -98,7 +98,7 @@ class ZmqAsyncPullQueue(Generic[T]):
         return self.decoder(msgpack.unpackb(event, raw=False))
 
     def stop(self):
-        self.socket.close()
+        self.socket.close(linger=0)
         self.context.term()
 
 
@@ -122,7 +122,7 @@ class ZmqPubQueue(Generic[T]):
         self.socket.send(event, copy=False)
 
     def stop(self):
-        self.socket.close()
+        self.socket.close(linger=0)
         self.context.term()
 
 
@@ -147,5 +147,5 @@ class ZmqSubQueue(Generic[T]):
         return self.socket.poll(timeout=0) == 0
 
     def stop(self):
-        self.socket.close()
+        self.socket.close(linger=0)
         self.context.term()

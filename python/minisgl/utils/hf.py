@@ -7,6 +7,7 @@ from huggingface_hub import hf_hub_download, snapshot_download
 from tqdm.asyncio import tqdm
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerBase
 
+
 class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
         kwargs.pop("name", None)
@@ -33,8 +34,11 @@ def _load_hf_config(model_path: str) -> Any:
 
 
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:
-    config = _load_hf_config(model_path)
-    return type(config)(**config.to_dict())
+    source = _load_hf_config(model_path)
+    config = type(source)(**source.to_dict())
+    # Transformers excludes this metadata from to_dict; TP peers still need to compare it.
+    config._commit_hash = getattr(source, "_commit_hash", None)
+    return config
 
 
 def download_hf_weight(model_path: str) -> str:

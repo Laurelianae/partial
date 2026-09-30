@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -17,6 +18,39 @@ class ServerArgs(SchedulerConfig):
     server_port: int = 1919
     num_tokenizer: int = 0
     silent_output: bool = False
+    node_rank: int = 0
+
+    def validate_topology(self) -> None:
+        if self.nnodes not in (1, 2):
+            raise ValueError("--nnodes must be 1 or 2")
+        if not 0 <= self.node_rank < self.nnodes:
+            raise ValueError("--node-rank must be in [0, nnodes)")
+        if self.nnodes == 2:
+            if self.tp_info.size != 2:
+                raise ValueError("Two Sparks require --tp-size 2 (one GPU worker per node)")
+            if not self.dist_init_addr:
+                raise ValueError("Two Sparks require --dist-init-addr HOST:PORT")
+            if self.offline_mode:
+                raise ValueError("Multi-node offline LLM usage is not supported")
+        if self.dist_init_addr:
+            host, separator, port = self.dist_init_addr.rpartition(":")
+            if not separator or not host or not port.isdigit() or not 1 <= int(port) <= 65535:
+                raise ValueError("--dist-init-addr must be HOST:PORT with port in [1, 65535]")
+            if self.nnodes == 2 and host.lower() in (
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                "[::1]",
+                "0.0.0.0",
+                "::",
+                "[::]",
+            ):
+                raise ValueError("Two Sparks need a rendezvous host reachable from both nodes")
+        if any(
+            not math.isfinite(timeout) or timeout <= 0
+            for timeout in (self.distributed_timeout, self.startup_timeout)
+        ):
+            raise ValueError("Startup and distributed timeouts must be positive")
 
     @property
     def share_tokenizer(self) -> bool:
@@ -48,6 +82,8 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def distributed_addr(self) -> str:
+        if self.dist_init_addr is not None:
+            return f"tcp://{self.dist_init_addr}"
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
@@ -86,9 +122,26 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument(
         "--tensor-parallel-size",
         "--tp-size",
+        "--tp",
         type=int,
         default=1,
         help="The tensor parallelism size.",
+    )
+
+    parser.add_argument("--nnodes", type=int, default=1, help="Number of Spark nodes: 1 or 2.")
+    parser.add_argument("--node-rank", type=int, default=0, help="This host's node rank: 0 or 1.")
+    parser.add_argument("--dist-init-addr", help="Node 0's rendezvous address, HOST:PORT.")
+    parser.add_argument(
+        "--distributed-timeout",
+        type=float,
+        default=None,
+        help="Collective timeout in seconds (single host: 60; two nodes: 120).",
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=ServerArgs.startup_timeout,
+        help="Maximum seconds to wait for worker readiness.",
     )
 
     parser.add_argument(
@@ -226,6 +279,27 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 
+    if kwargs["tensor_parallel_size"] < 1:
+        parser.error("--tp-size must be positive")
+    if kwargs["distributed_timeout"] is None:
+        kwargs["distributed_timeout"] = 120.0 if kwargs["nnodes"] == 2 else 60.0
+    if kwargs["nnodes"] == 2:
+        kwargs["use_pynccl"] = False
+    # Reject topology errors before loading or downloading a model configuration.
+    try:
+        ServerArgs(
+            model_path=kwargs["model_path"],
+            dtype=torch.float16,
+            tp_info=DistributedInfo(0, kwargs["tensor_parallel_size"]),
+            nnodes=kwargs["nnodes"],
+            node_rank=kwargs["node_rank"],
+            dist_init_addr=kwargs["dist_init_addr"],
+            distributed_timeout=kwargs["distributed_timeout"],
+            startup_timeout=kwargs["startup_timeout"],
+        ).validate_topology()
+    except ValueError as error:
+        parser.error(str(error))
+
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
     if run_shell:
@@ -259,10 +333,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "float32": torch.float32,
     }
     kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
-    kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
+    global_rank = kwargs["node_rank"] if kwargs["nnodes"] == 2 else 0
+    kwargs["tp_info"] = DistributedInfo(global_rank, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 
     result = ServerArgs(**kwargs)
+    try:
+        result.validate_topology()
+    except ValueError as error:
+        parser.error(str(error))
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell
