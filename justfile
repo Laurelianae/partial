@@ -63,3 +63,11 @@ serve-node node model *args: (sync node)
 # Run one side of Naive reference parity; invoke both nodes concurrently.
 naive-parity node model dtype="float32" *args: (sync node)
     @python3 tools/naive_parity_remote.py "$1" "$2" "$3" "${@:4}"
+
+# Supervised fixture regression; --quick runs core and BF16 TP=1 only.
+naive-regression fixture *args: sync-all
+    @python3 tools/naive_runner.py regression "$1" "${@:2}"
+
+# Native-only prefill/decode measurement, with --tp-size 1 or 2.
+naive-measure fixture *args: sync-all
+    @python3 tools/naive_runner.py measure "$1" "${@:2}"

@@ -207,18 +207,27 @@ def test_gather_last_dim_preserves_token_and_rank_order(monkeypatch, size):
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("tokens", [1, 13, 127])
 @pytest.mark.parametrize("has_bias", [False, True])
-def test_bf16_tp_output_projection_matches_unsharded_gemm(monkeypatch, rank, tokens, has_bias):
+@pytest.mark.parametrize("input_size,output_size", [(1024, 256), (8192, 4096), (2048, 4096)])
+def test_bf16_tp_output_projection_matches_unsharded_gemm(
+    monkeypatch, rank, tokens, has_bias, input_size, output_size
+):
     import minisgl.models.naive as naive
 
     monkeypatch.setattr(naive, "get_tp_info", lambda: SimpleNamespace(rank=rank, size=2))
     generator = torch.Generator(device="cuda").manual_seed(42)
-    states = torch.randn(tokens, 1024, device="cuda", generator=generator).bfloat16()
-    weight = (torch.randn(256, 1024, device="cuda", generator=generator) * 0.02).bfloat16()
-    bias = torch.randn(256, device="cuda", generator=generator).bfloat16() if has_bias else None
+    states = torch.randn(tokens, input_size, device="cuda", generator=generator).bfloat16()
+    weight = (
+        torch.randn(output_size, input_size, device="cuda", generator=generator) * 0.02
+    ).bfloat16()
+    bias = (
+        torch.randn(output_size, device="cuda", generator=generator).bfloat16()
+        if has_bias
+        else None
+    )
     expected = torch.nn.functional.linear(states, weight, bias)
     inputs, outputs = states.chunk(2, dim=-1), expected.chunk(2, dim=-1)
     with torch_dtype(torch.bfloat16):
-        projection = NaiveRowLinear(1024, 256, has_bias)
+        projection = NaiveRowLinear(input_size, output_size, has_bias)
     projection.weight = weight.chunk(2, dim=0)[rank].contiguous()
     projection.bias = None if bias is None else bias.chunk(2)[rank].contiguous()
 
@@ -241,3 +250,120 @@ def test_bf16_tp_output_projection_matches_unsharded_gemm(monkeypatch, rank, tok
     assert projection.weight.numel() == weight.numel() // 2
     assert projection._comm.calls == 2
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "duplicate", "shape", "quantized", "alias"])
+def test_expert_checkpoint_across_files(tmp_path, monkeypatch, fault):
+    import minisgl.models.weight as loader
+
+    monkeypatch.setattr(loader, "get_tp_info", lambda: SimpleNamespace(rank=0, size=1))
+    c = ModelConfig.from_hf(
+        config(hidden_size=4, n_routed_experts=2, num_experts_per_tok=1, moe_intermediate_size=8)
+    )
+    prefix = "model.layers.1.mlp.experts."
+    tensors = {
+        prefix + "gate_proj": torch.ones(2, 8, 4),
+        prefix + "up_proj": torch.full((2, 8, 4), 2.0),
+        prefix + "down_proj": torch.ones(2, 4, 8),
+    }
+    if fault == "missing":
+        del tensors[prefix + "up_proj"]
+    if fault == "shape":
+        tensors[prefix + "gate_proj"] = torch.ones(2, 7, 4)
+    if fault == "quantized":
+        tensors[prefix + "scale_inv"] = torch.ones(1)
+    if fault == "alias":
+        tensors[prefix + "gate_proj.weight"] = tensors[prefix + "gate_proj"]
+    files = []
+    for i, (name, tensor) in enumerate(tensors.items()):
+        file = tmp_path / f"{i}.safetensors"
+        save_file({name: tensor}, str(file))
+        files.append(str(file))
+    if fault == "duplicate":
+        files.append(files[0])
+    if fault:
+        with pytest.raises(ValueError):
+            dict(_load_naive_weight(files, c, torch.device("cpu")))
+    else:
+        result = dict(_load_naive_weight(files, c, torch.device("cpu")))
+        torch.testing.assert_close(
+            result[prefix + "gate_up_proj"],
+            torch.cat((tensors[prefix + "gate_proj"], tensors[prefix + "up_proj"]), dim=1),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Production expert GEMM requires CUDA")
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("tokens", [1, 13, 127])
+def test_production_individual_expert_gate_up(monkeypatch, rank, tokens):
+    import minisgl.models.naive as naive
+
+    monkeypatch.setattr(naive, "get_tp_info", lambda: SimpleNamespace(rank=rank, size=2))
+    generator = torch.Generator(device="cuda").manual_seed(43)
+    states = torch.randn(tokens, 4096, device="cuda", generator=generator).bfloat16()
+    # One expert at a time, never the full production expert bank.
+    weight = (torch.randn(4096, 4096, device="cuda", generator=generator) * 0.02).bfloat16()
+    expected = torch.nn.functional.linear(states, weight)
+    gate, up = weight.chunk(2)
+    local = torch.cat((gate.chunk(2)[rank], up.chunk(2)[rank]))
+    with torch_dtype(torch.bfloat16):
+        projection = naive.NaiveColumnLinear(4096, 2048, False)
+    projection.weight = local
+    actual = projection.forward(states)
+    gate_out, up_out = expected.chunk(2, dim=-1)
+    wanted = torch.cat((gate_out.chunk(2, dim=-1)[rank], up_out.chunk(2, dim=-1)[rank]), -1)
+    torch.testing.assert_close(actual, wanted, atol=0.025, rtol=0.025)
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "alias", "shape", "integer", "config"])
+def test_individual_experts_across_files(tmp_path, monkeypatch, fault):
+    import minisgl.models.weight as loader
+
+    monkeypatch.setattr(loader, "get_tp_info", lambda: SimpleNamespace(rank=0, size=1))
+    kwargs = {"quantization_config": {"quant_method": "fp8"}} if fault == "config" else {}
+    c = ModelConfig.from_hf(
+        config(
+            hidden_size=4,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=8,
+            **kwargs,
+        )
+    )
+    prefix = "model.layers.1.mlp.experts."
+    tensors = {
+        f"{prefix}{i}.{name}_proj.weight": torch.full(shape, float(i + 1))
+        for i in range(2)
+        for name, shape in [("gate", (8, 4)), ("up", (8, 4)), ("down", (4, 8))]
+    }
+    key = prefix + "0.gate_proj.weight"
+    if fault == "missing":
+        del tensors[key]
+    if fault == "alias":
+        tensors[key.removesuffix(".weight")] = tensors[key]
+    if fault == "shape":
+        tensors[key] = torch.ones(7, 4)
+    if fault == "integer":
+        tensors[key] = torch.ones(8, 4, dtype=torch.int8)
+    files = []
+    for i, (name, value) in enumerate(tensors.items()):
+        file = tmp_path / f"{i:02d}.safetensors"
+        save_file({name: value}, str(file))
+        files.append(str(file))
+    if fault:
+        with pytest.raises(ValueError):
+            dict(_load_naive_weight(files, c, torch.device("cpu")))
+    else:
+        result = dict(_load_naive_weight(files, c, torch.device("cpu")))
+        expected = torch.stack(
+            [
+                torch.cat(
+                    (
+                        tensors[f"{prefix}{i}.gate_proj.weight"],
+                        tensors[f"{prefix}{i}.up_proj.weight"],
+                    )
+                )
+                for i in range(2)
+            ]
+        )
+        torch.testing.assert_close(result[prefix + "gate_up_proj"], expected)

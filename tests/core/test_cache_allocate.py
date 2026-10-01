@@ -4,10 +4,9 @@ Test that CacheManager._allocate correctly handles eviction with page_size > 1.
 
 from __future__ import annotations
 
+import minisgl.core as core
 import pytest
 import torch
-
-import minisgl.core as core
 from minisgl.scheduler.cache import CacheManager
 
 
@@ -201,3 +200,77 @@ class TestAllocateEvictPageAlignment:
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+@pytest.mark.parametrize("page_size", [1, 4, 8])
+def test_fragmented_cancel_reallocate_and_evict(page_size):
+    cm = _make_cache_manager(8, page_size)
+    held = cm._allocate(8)
+    # Cancellation releases alternating pages, forcing a fragmented subsequent history.
+    cm._free(cm._page_to_token(held[::2]))
+    fragmented = cm._allocate(4)
+    assert torch.equal(fragmented, held[::2])
+    _assert_no_overlap(torch.cat((fragmented, held[1::2])), page_size)
+    tokens = cm._page_to_token(fragmented)
+    _insert_evictable(cm, torch.arange(len(tokens), dtype=torch.int32), tokens)
+    cm._free(cm._page_to_token(held[1::2]))
+    cm.check_integrity()
+    active = cm._allocate(4)
+    reused = cm._allocate(4)  # Evict the fragmented cached history.
+    _assert_no_overlap(torch.cat((active, reused)), page_size)
+    cm._free(cm._page_to_token(torch.cat((active, reused))))
+    cm.check_integrity()
+    assert cm.free_slots.unique().numel() == 8
+
+
+@pytest.mark.parametrize("page_size", [1, 4, 8])
+def test_naive_cache_reuse_matches_fresh_attention(page_size, monkeypatch):
+    from types import SimpleNamespace
+
+    import minisgl.kvcache.naive_pool as pool_module
+    from minisgl.attention.naive import attention
+    from minisgl.models.config import ModelConfig
+    from minisgl.models.naive_config import NaiveN05FlashConfig
+
+    monkeypatch.setattr(pool_module, "get_tp_info", lambda: SimpleNamespace(size=1))
+    c = ModelConfig.from_hf(
+        NaiveN05FlashConfig(
+            num_hidden_layers=1,
+            hybrid_layer_pattern=[0],
+            moe_layer_freq=[0],
+            num_attention_heads=1,
+            num_key_value_heads=1,
+        )
+    )
+    pool = pool_module.NaiveKVCache(c, 8, page_size, torch.float32, torch.device("cpu"))
+    cm = _make_cache_manager(8, page_size)
+    all_pages = cm._allocate(8)
+    cm._free(cm._page_to_token(all_pages[::2]))  # Cancel fragmented history.
+    pages = cm._allocate(4)
+    locations = cm._page_to_token(pages)
+    n = len(locations)
+    generator = torch.Generator().manual_seed(51)
+    k = torch.randn(n, 1, 192, generator=generator)
+    v = torch.randn(n, 1, 128, generator=generator)
+    index = torch.randn(n, 128, generator=generator)
+    pool.store_kv(k * 99, v * 99, locations, 0)
+    pool.store_index(index * 99, locations, 0)
+    _insert_evictable(cm, torch.arange(n, dtype=torch.int32), locations)
+    cm._free(cm._page_to_token(all_pages[1::2]))
+    cm.check_integrity()
+    active = cm._allocate(4)
+    reused = cm._allocate(4)  # Evict and overwrite old KV/indexer entries.
+    reused_locations = cm._page_to_token(reused)
+    pool.store_kv(k, v, reused_locations, 0)
+    pool.store_index(index, reused_locations, 0)
+    actual_k = pool.k_cache(0).flatten(0, 1)[reused_locations.long()]
+    actual_v = pool.v_cache(0).flatten(0, 1)[reused_locations.long()]
+    torch.testing.assert_close(pool.index_cache(0)[reused_locations.long()], index)
+    q = torch.randn(1, 3, 192, generator=generator)
+    allowed = torch.ones(3, n, dtype=torch.bool)
+    actual = attention(q, actual_k.transpose(0, 1), actual_v.transpose(0, 1), allowed, None, None)
+    fresh = attention(q, k.transpose(0, 1), v.transpose(0, 1), allowed, None, None)
+    torch.testing.assert_close(actual, fresh)
+    cm._free(cm._page_to_token(torch.cat((active, reused))))
+    cm.check_integrity()
+    assert cm.free_slots.unique().numel() == 8

@@ -19,6 +19,9 @@ def main() -> int:
     parity = server_args[:1] == ["--check-naive-parity"]
     if parity:
         server_args = server_args[1:]
+    command = server_args[:1] == ["--run-command"]
+    if command:
+        server_args = server_args[1:]
     # SSH does not activate the venv. JIT builds still need its ninja executable on PATH.
     os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]
     stopping = threading.Event()
@@ -29,7 +32,11 @@ def main() -> int:
         (
             [sys.executable, "tests/misc/check_naive_parity.py", *server_args]
             if parity
-            else [sys.executable, "-m", "minisgl", *server_args]
+            else (
+                [sys.executable, *server_args]
+                if command
+                else [sys.executable, "-m", "minisgl", *server_args]
+            )
         ),
         start_new_session=True,
         stdin=subprocess.DEVNULL if watch_stdin else None,

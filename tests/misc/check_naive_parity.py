@@ -14,6 +14,7 @@ from minisgl.engine import Engine, EngineConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from naive_reference import load_reference
+from naive_results import emit, metadata
 
 
 @torch.inference_mode()
@@ -24,6 +25,7 @@ def main() -> None:
     parser.add_argument("--nnodes", type=int, choices=(1, 2), default=1)
     parser.add_argument("--node-rank", type=int, choices=(0, 1), default=0)
     parser.add_argument("--tp-size", type=int)
+    parser.add_argument("--page-size", type=int, default=1)
     parser.add_argument("--production-top-k", action="store_true")
     parser.add_argument("--dist-init-addr", default="127.0.0.1:29610")
     args = parser.parse_args()
@@ -40,6 +42,7 @@ def main() -> None:
             dist_init_addr=args.dist_init_addr,
             use_pynccl=False,
             num_page_override=4096,
+            page_size=args.page_size,
             max_running_req=4,
         )
     )
@@ -78,7 +81,7 @@ def main() -> None:
                     )
                 states = states + attn + mlp
 
-    def run(prompts, chunks, cached_prefix=0, location_offset=0):
+    def run(prompts, chunks, cached_prefix=0, location_offset=0, fragmented=False):
         nonlocal max_error, max_relative_l2, reference_caches
         if cached_prefix == 0:
             reference_caches = [None] * len(prompts)
@@ -87,6 +90,11 @@ def main() -> None:
             engine.page_table[row, : len(prompt)] = torch.arange(
                 offset, offset + len(prompt), device=engine.device
             )
+            if fragmented:
+                locations = engine.page_table[row, : len(prompt)]
+                engine.page_table[row, : len(prompt)] = (
+                    locations // args.page_size * 3 + 3
+                ) * args.page_size + locations % args.page_size
             offset += len(prompt)
         consumed = [cached_prefix] * len(prompts)
         last = None
@@ -236,6 +244,12 @@ def main() -> None:
         relocated = run([continuation], [132], location_offset=1000)
         if dtype == torch.float32:
             torch.testing.assert_close(reused.float(), relocated.float(), atol=2e-5, rtol=2e-5)
+        fresh = run([continuation], [132])
+        fragmented = run([continuation], [13] * 11, fragmented=True)
+        tolerance = 2e-5 if dtype == torch.float32 else 0.025
+        torch.testing.assert_close(
+            fresh.float(), fragmented.float(), atol=tolerance, rtol=tolerance
+        )
         # Cached greedy generation, using identical histories in both implementations.
         prompt = [100, 101, 102, 103, 104]
         greedy = []
@@ -256,6 +270,18 @@ def main() -> None:
             f"rank={args.node_rank} dtype={dtype} max_logit_error={max_error:.8g} "
             f"max_relative_l2={max_relative_l2:.8g} greedy={greedy}",
             flush=True,
+        )
+        emit(
+            {
+                **metadata(args.model),
+                "rank": args.node_rank,
+                "tp_size": args.nnodes,
+                "dtype": args.dtype,
+                "backend": "naive-eager",
+                "max_logit_error": max_error,
+                "max_relative_l2": max_relative_l2,
+                "generated_token_ids": greedy,
+            }
         )
     finally:
         engine.shutdown()

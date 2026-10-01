@@ -19,7 +19,23 @@ def main() -> None:
     parser.add_argument("--graph", type=int, default=0)
     parser.add_argument("--cache-type", choices=("radix", "naive"), default="radix")
     parser.add_argument("--no-overlap", action="store_true")
+    parser.add_argument("--nnodes", type=int, default=1)
+    parser.add_argument("--node-rank", type=int, default=0)
+    parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--dist-init-addr")
     args = parser.parse_args()
+    topology = []
+    if args.nnodes > 1:
+        topology = [
+            "--nnodes",
+            str(args.nnodes),
+            "--node-rank",
+            str(args.node_rank),
+            "--tp-size",
+            str(args.tp_size),
+            "--dist-init-addr",
+            args.dist_init_addr,
+        ]
     url = f"http://127.0.0.1:{args.port}"
     try:
         with urlopen(url + "/v1/models", timeout=1):
@@ -51,11 +67,13 @@ def main() -> None:
                 "8",
                 "--cache-type",
                 args.cache_type,
+                *topology,
             ],
             stdin=subprocess.PIPE,
             stdout=log,
             stderr=subprocess.STDOUT,
             env=environment,
+            start_new_session=True,
         )
         try:
             deadline = time.monotonic() + 120
@@ -80,17 +98,19 @@ def main() -> None:
                 ],
                 check=True,
             )
-        except Exception:
-            log.seek(0)
-            print(log.read(), flush=True)
-            raise
         finally:
             process.stdin.close()
             try:
                 process.wait(timeout=20)
             except subprocess.TimeoutExpired:
                 process.terminate()
-                process.wait(timeout=20)
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+            log.seek(0)
+            print(log.read(), flush=True)
 
 
 if __name__ == "__main__":

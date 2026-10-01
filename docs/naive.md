@@ -118,3 +118,63 @@ BF16 TP beyond the tested fixture and hardware, speculative decoding, or through
 Full BF16 weights require roughly
 618 GB; FP8 alone is still too large for the two Sparks. Quantized loading and memory
 placement remain separate work.
+
+## Reproducible regression and measurement
+
+With the same fixture installed on both Sparks:
+
+```bash
+just naive-regression .cache/naive-fixture
+just naive-regression .cache/naive-fixture --quick
+just naive-measure .cache/naive-fixture --tp-size 1 --prompt-length 128 --batch-size 2 --warmup 2 --repeat 5
+just naive-measure .cache/naive-fixture --tp-size 2 --dtype bfloat16 --prompt-length 128 --batch-size 2 --warmup 2 --repeat 5
+```
+
+The full regression checks fixture file hashes across nodes before execution, runs
+core and supervisor tests, FP32/BF16 TP=1/TP=2 parity including production sparse
+top-k and page size four, Naive API checks at TP=1/TP=2, and a Qwen3-0.6B API smoke
+check. `--quick` runs core tests and BF16 TP=1 parity only. Both TP workers launch
+automatically; failures, a per-job `--timeout` (default 1,800 seconds), and Ctrl-C
+close the SSH lifetime pipes and stop managed workers. The fixture must already
+exist; these commands do not generate or download it.
+
+Results are written locally to `.cache/naive-results/<timestamp>/results.json`
+and per-job `rank-*.log` files. `--output` changes the parent directory. Parity
+results include the local source commit, checkpoint/config/tokenizer hashes,
+GPU and software versions, error metrics, and generated token IDs. The local
+commit is forwarded explicitly because remote synchronization excludes `.git`;
+logs and results describe the synchronized working tree, which may include
+uncommitted changes.
+
+Measurement launches a separate native-only process and never loads the upstream
+reference. It measures complete eager forward workloads including batch construction
+and attention metadata: full prefill, then one cached decode step with an already
+populated prompt history. Each repetition uses the same synthetic token history;
+it is not an autoregressive throughput benchmark. CUDA is synchronized around
+each sample. TP results retain each rank's samples and report the slowest rank
+for each repetition, separately for prefill and decode.
+
+Memory fields use bytes: `resident_pytorch_bytes` is allocated/reserved memory
+after warmup, `peak_pytorch_bytes` is allocated/reserved high-water memory during
+repetitions, and `device_bytes` is CUDA device free/total memory after that phase.
+These counters describe different scopes and must not be added together. PyTorch
+counters do not include all driver, communication, or external allocator memory.
+The cache allocation scales with batch size and prompt length. Fixture timings
+are diagnostics only, not full-model baselines, capacity estimates, or performance
+targets; no timing thresholds are enforced.
+
+Production projection tests use full attention output dimensions and individual
+expert projection dimensions, with synthetic weights allocated one projection at
+a time. Storage layout assertions cover the existing eager loader only. Future
+backends should test logical weight reconstruction and execution rather than
+inherit its packing and sharding assumptions. Quantization, GPU packing, placement,
+and capacity planning remain separate work.
+
+The supervised full regression was validated on both GB10 Sparks on 2026-10-01
+with PyTorch `2.9.1+cu130`, CUDA `13.0`, and Transformers `5.17.0`: expanded core
+and supervisor tests, all four parity combinations, Naive API checks at TP=1/TP=2,
+and the Qwen smoke check passed. Native-only measurement was validated at TP=1
+and TP=2 with prompt length 32, batch size two, one warmup, and two repetitions;
+JSON phase separation, memory scopes, rank completeness, and slowest-rank
+aggregation were checked. These runs establish harness behavior, not a performance
+baseline.

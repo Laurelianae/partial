@@ -63,7 +63,10 @@ def print_node_output(node: int, process: subprocess.Popen) -> None:
 def stop_nodes(processes: list[subprocess.Popen]) -> None:
     # EOF tells the remote wrapper to stop its managed process group, even over SSH.
     for process in processes:
-        process.stdin.close()
+        try:
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
     deadline = time.monotonic() + 15.0
     for process in processes:
         try:
@@ -75,7 +78,7 @@ def stop_nodes(processes: list[subprocess.Popen]) -> None:
             process.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.wait()
+            process.wait(timeout=1.0)
 
 
 def main() -> int:

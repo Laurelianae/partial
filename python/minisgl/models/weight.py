@@ -141,6 +141,8 @@ def _load_naive_weight(files, config, device, *, dtype: torch.dtype | None = Non
     rank, size = get_tp_info().rank, get_tp_info().size
     experts = {}
     packed_parts = {}
+    seen = set()
+    emitted = set()
 
     def shard(name, tensor):
         if name.endswith(".experts.gate_up_proj"):
@@ -164,6 +166,9 @@ def _load_naive_weight(files, config, device, *, dtype: torch.dtype | None = Non
         return _shard_tensor(name, tensor, rank, size, c.num_key_value_heads)
 
     def output(name, tensor):
+        if name in emitted:
+            raise ValueError(f"Duplicate Naive logical tensor: {name}")
+        emitted.add(name)
         dtype = (
             torch.float32
             if name.endswith((".mlp.gate.weight", ".e_score_correction_bias"))
@@ -173,11 +178,22 @@ def _load_naive_weight(files, config, device, *, dtype: torch.dtype | None = Non
 
     def pack(name, tensor):
         # Transformers 5 checkpoints can store already-packed experts without .weight.
-        if ".experts." in name and tensor.ndim == 3:
+        if ".experts." in name:
             name = name.removesuffix(".weight")
+            projection = name.rsplit(".", 1)[-1]
+            expected = {
+                "gate_up_proj": (c.n_routed_experts, 2 * c.moe_intermediate_size, c.hidden_size),
+                "gate_proj": (c.n_routed_experts, c.moe_intermediate_size, c.hidden_size),
+                "up_proj": (c.n_routed_experts, c.moe_intermediate_size, c.hidden_size),
+                "down_proj": (c.n_routed_experts, c.hidden_size, c.moe_intermediate_size),
+            }.get(projection)
+            if expected is None or tuple(tensor.shape) != expected:
+                raise ValueError(f"Malformed Naive packed expert tensor: {name} {tensor.shape}")
             if name.endswith((".gate_proj", ".up_proj")):
                 prefix, projection = name.rsplit(".", 1)
                 parts = packed_parts.setdefault(prefix, {})
+                if projection in parts:
+                    raise ValueError(f"Duplicate Naive packed expert entry: {name}")
                 parts[projection] = tensor
                 if len(parts) == 2:
                     del packed_parts[prefix]
@@ -191,8 +207,15 @@ def _load_naive_weight(files, config, device, *, dtype: torch.dtype | None = Non
     for file in sorted(files):
         with safetensors.safe_open(file, framework="pt", device="cpu") as reader:
             for name in reader.keys():
+                if name in seen:
+                    raise ValueError(f"Duplicate Naive checkpoint tensor: {name}")
+                seen.add(name)
                 tensor = reader.get_tensor(name)
-                if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) or "scale_inv" in name:
+                if (
+                    tensor.dtype
+                    not in (torch.float32, torch.bfloat16, torch.float16, torch.float64)
+                    or "scale_inv" in name
+                ):
                     raise ValueError("Quantized Naive weights require a quantized loader")
                 match = _EXPERT_PATTERN.match(name)
                 if match:
@@ -200,7 +223,22 @@ def _load_naive_weight(files, config, device, *, dtype: torch.dtype | None = Non
                     projection = match.group("name").removesuffix(".weight")
                     key = prefix + "." + projection
                     parts = experts.setdefault(key, {})
-                    parts[int(match.group("idx"))] = tensor
+                    idx = int(match.group("idx"))
+                    if idx >= c.n_routed_experts:
+                        raise ValueError(f"Invalid Naive expert index: {idx}")
+                    expected = (
+                        (c.hidden_size, c.moe_intermediate_size)
+                        if projection == "down_proj"
+                        else (c.moe_intermediate_size, c.hidden_size)
+                    )
+                    if (
+                        projection not in ("gate_proj", "up_proj", "down_proj")
+                        or tuple(tensor.shape) != expected
+                    ):
+                        raise ValueError(f"Malformed Naive expert tensor: {name} {tensor.shape}")
+                    if idx in parts:
+                        raise ValueError(f"Duplicate Naive expert entry: {name}")
+                    parts[idx] = tensor
                     if len(parts) != c.n_routed_experts:
                         continue
                     tensor = torch.stack([parts[i] for i in range(c.n_routed_experts)])
