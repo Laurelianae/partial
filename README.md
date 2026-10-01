@@ -1,3 +1,14 @@
+# PartialRT
+
+This is a specialized runtime for running [NaiveAI/Naive-N0.5-Flash](https://huggingface.co/NaiveAI/Naive-N0.5-Flash) on a dual spark cluster, completely based on [Mini-SGLang](https://github.com/sgl-project/mini-sglang).
+
+> [!IMPORTANT]
+> The changes to Mini-SGLang are almost completely written by AI, since I don't know LLM engine development well, 
+> and would like to know much current models can already do there.
+
+Below is the original Mini-SGLang readme, until I have written a proper readme for this server.
+
+
 <p align="center">
 <img width="400" src="/assets/logo.png">
 </p>
