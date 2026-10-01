@@ -22,7 +22,10 @@ def fixture_identity(path: str | Path) -> dict:
             files[str(file.relative_to(root))] = digest.hexdigest()
     if not files or not any(name.endswith(".safetensors") for name in files):
         raise ValueError(f"No checkpoint tensors in {root}")
-    return {"path": str(path), "files": files}
+    config = (
+        json.loads((root / "config.json").read_text()) if (root / "config.json").exists() else {}
+    )
+    return {"path": str(path), "files": files, "quantized": bool(config.get("quantization_config"))}
 
 
 def metadata(model: str | Path) -> dict:

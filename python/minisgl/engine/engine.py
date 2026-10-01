@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from time import monotonic
 from typing import Any, Dict, NamedTuple, Tuple
 
 import torch
@@ -64,7 +65,19 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        load_started = monotonic()
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        torch.cuda.synchronize(self.device)
+        self.weight_loading_seconds = monotonic() - load_started
+        self.weight_resident_bytes = sum(
+            tensor.numel() * tensor.element_size() for tensor in self.model.state_dict().values()
+        )
+        self.weight_loading_peak_bytes = torch.cuda.max_memory_allocated(self.device)
+        logger.info(
+            f"Weights loaded in {self.weight_loading_seconds:.2f}s; "
+            f"resident tensors {mem_GB(self.weight_resident_bytes)}, "
+            f"loading peak PyTorch allocation {mem_GB(self.weight_loading_peak_bytes)}"
+        )
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -176,7 +189,12 @@ class Engine:
                     torch.float32
                     if config.model_config.is_naive
                     and (k.endswith("mlp.gate.weight") or k.endswith("e_score_correction_bias"))
-                    else self.dtype
+                    else (
+                        v.dtype
+                        if config.model_config.is_naive
+                        and k.endswith((".qweight", ".qzeros", ".scales"))
+                        else self.dtype
+                    )
                 )
                 for k, v in load_weight(config.model_path, self.device, dtype=self.dtype)
             }
@@ -188,6 +206,15 @@ class Engine:
             config.model_config.kv_bytes_per_token(config.tp_info.size, self.dtype.itemsize)
             * config.page_size
         )
+        from minisgl.models.autoround import execution_workspace
+
+        workspace = (
+            execution_workspace(config.model_config.naive_config, config.tp_info.size)
+            if config.model_config.is_naive
+            else 0
+        )
+        if workspace:
+            logger.info_rank0(f"Packed expert execution reserve: {mem_GB(workspace)}")
         num_pages = config.num_page_override
         if num_pages is None:
             if self.multi_node:
@@ -199,8 +226,10 @@ class Engine:
             else:
                 model_memory = old_free_memory - new_free_memory
                 available_memory = int(config.memory_ratio * old_free_memory) - model_memory
-            num_pages = available_memory // cache_per_page
+            num_pages = (available_memory - workspace) // cache_per_page
 
+        if workspace and num_pages * cache_per_page + workspace > self.local_free_memory:
+            raise ValueError("KV cache override leaves insufficient packed-expert workspace")
         if self.multi_node:
             pages = torch.tensor(num_pages, dtype=torch.int64)
             torch.distributed.all_reduce(
@@ -284,8 +313,10 @@ def _adjust_config(config: EngineConfig):
             raise ValueError("Naive uses its own eager sigmoid MoE implementation")
         if config.use_dummy_weight:
             raise ValueError("Use tools/make_naive_fixture.py instead of --dummy-weight for Naive")
-        if getattr(config.hf_config, "quantization_config", None):
-            raise ValueError("Quantized Naive checkpoints are not supported by the eager BF16 path")
+        from minisgl.models.autoround import validate_quantization
+
+        if validate_quantization(config.hf_config) and config.dtype != torch.bfloat16:
+            raise ValueError("AutoRound Naive inference requires bfloat16")
         if config.dtype not in (torch.bfloat16, torch.float32):
             raise ValueError("Naive eager execution supports BF16 and FP32")
         override("attention_backend", "naive")

@@ -17,6 +17,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--int4", action="store_true", help="Pack routed experts as AutoRound GPTQ")
     args = parser.parse_args()
     folder = args.output
     if folder.exists() and any(folder.iterdir()):
@@ -82,6 +83,13 @@ def main() -> None:
     for name in tensors:
         if not name.endswith(("mlp.gate.weight", "e_score_correction_bias")):
             tensors[name] = tensors[name].to(torch.bfloat16)
+    if args.int4:
+        from autoround_reference import QUANTIZATION, quantize_experts
+
+        tensors = quantize_experts(tensors)
+        config_data = json.loads((folder / "config.json").read_text())
+        config_data["quantization_config"] = QUANTIZATION
+        (folder / "config.json").write_text(json.dumps(config_data, indent=2) + "\n")
     save_file(tensors, str(folder / "model.safetensors"), metadata={"format": "pt"})
     (folder / "fixture_manifest.json").write_text(
         json.dumps(
@@ -90,6 +98,7 @@ def main() -> None:
                 "upstream_revision": UPSTREAM_REVISION,
                 "seed": args.seed,
                 "synthetic": True,
+                "quantized": args.int4,
                 "torch": torch.__version__,
             },
             indent=2,

@@ -136,8 +136,13 @@ def _load_naive_weight(files, config, device, *, dtype: torch.dtype | None = Non
     """Naive keeps split attention/dense projections and packs only expert matrices."""
     c = config.naive_config
     assert c is not None
-    if getattr(c, "quantization_config", None):
-        raise ValueError("Quantized Naive checkpoints are not supported yet")
+    from .autoround import validate_quantization
+
+    if validate_quantization(c):
+        if dtype != torch.bfloat16:
+            raise ValueError("AutoRound Naive inference requires bfloat16")
+        yield from _load_autoround_weight(files, config, device)
+        return
     rank, size = get_tp_info().rank, get_tp_info().size
     experts = {}
     packed_parts = {}
@@ -249,3 +254,64 @@ def _load_naive_weight(files, config, device, *, dtype: torch.dtype | None = Non
                     yield result
     if experts or packed_parts:
         raise ValueError("Incomplete Naive expert tensors in checkpoint")
+
+
+def _load_autoround_weight(files, config, device):
+    """Fill final expert arrays from rank-local CPU slices, without stacking copies."""
+    from pathlib import Path
+
+    from .autoround import _DTYPES, EXPERT, inspect_checkpoint
+
+    c = config.naive_config
+    rank, size = get_tp_info().rank, get_tp_info().size
+    if not files:
+        raise ValueError("No AutoRound checkpoint shards found")
+    report = inspect_checkpoint(Path(files[0]).parent, c, size)
+    expected_files = {str(Path(e["file"]).resolve()) for e in report["entries"].values()}
+    if len(set(files)) != len(files) or {str(Path(f).resolve()) for f in files} != expected_files:
+        raise ValueError("Duplicate or incomplete AutoRound checkpoint shard list")
+    buffers = {}
+    remaining = {}
+    # Preallocate each final array once. Components can reside in different files.
+    for name, spec in report["entries"].items():
+        match = EXPERT.match(name)
+        if not match:
+            continue
+        layer, expert, projection, component = match.groups()
+        key = f"model.layers.{layer}.mlp.experts.{projection}.{component}"
+        if key not in buffers:
+            shape = (c.n_routed_experts, spec["shape"][0], spec["shape"][1] // size)
+            buffers[key] = torch.empty(shape, dtype=_DTYPES[spec["dtype"]][0], device=device)
+            remaining[key] = c.n_routed_experts
+    for file in sorted(files):
+        with safetensors.safe_open(file, framework="pt", device="cpu") as reader:
+            for name in reader.keys():
+                match = EXPERT.match(name)
+                if match:
+                    layer, expert, projection, component = match.groups()
+                    key = f"model.layers.{layer}.mlp.experts.{projection}.{component}"
+                    target = buffers[key][int(expert)]
+                    width = target.shape[1]
+                    sliced = reader.get_slice(name)[:, rank * width : (rank + 1) * width]
+                    target.copy_(sliced)
+                    del sliced, target
+                    remaining[key] -= 1
+                    if not remaining[key]:
+                        yield key, buffers.pop(key)
+                else:
+                    # Reuse established BF16 sharding for all non-expert tensors.
+                    tensor = reader.get_tensor(name)
+                    if name.endswith((".o_proj.weight", ".down_proj.weight")):
+                        tensor = tensor.chunk(size, dim=0)[rank]
+                    elif ".indexer." in name or ".mlp.gate." in name:
+                        pass
+                    elif name.endswith(".attention_sink_bias"):
+                        tensor = tensor.chunk(size)[rank]
+                    else:
+                        heads = c.num_key_value_heads
+                        if ".self_attn." in name:
+                            layer = int(name.split(".layers.")[1].split(".")[0])
+                            if c.hybrid_layer_pattern[layer]:
+                                heads = c.swa_num_key_value_heads
+                        tensor = _shard_tensor(name, tensor, rank, size, heads)
+                    yield name, tensor.contiguous().to(device=device)

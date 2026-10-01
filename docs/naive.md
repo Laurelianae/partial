@@ -116,8 +116,8 @@ Synthetic parity establishes implementation behavior for the tested configuratio
 It does not qualify full trained-weight loading, quantization, long-context capacity,
 BF16 TP beyond the tested fixture and hardware, speculative decoding, or throughput.
 Full BF16 weights require roughly
-618 GB; FP8 alone is still too large for the two Sparks. Quantized loading and memory
-placement remain separate work.
+618 GB; FP8 alone is still too large for the two Sparks. AutoRound INT4 routed-expert
+loading is implemented as described below; full trained-weight qualification is pending.
 
 ## Reproducible regression and measurement
 
@@ -167,8 +167,8 @@ Production projection tests use full attention output dimensions and individual
 expert projection dimensions, with synthetic weights allocated one projection at
 a time. Storage layout assertions cover the existing eager loader only. Future
 backends should test logical weight reconstruction and execution rather than
-inherit its packing and sharding assumptions. Quantization, GPU packing, placement,
-and capacity planning remain separate work.
+inherit its packing and sharding assumptions. Optimized INT4 kernels, other packing formats, and full-model capacity qualification
+remain separate work.
 
 The supervised full regression was validated on both GB10 Sparks on 2026-10-01
 with PyTorch `2.9.1+cu130`, CUDA `13.0`, and Transformers `5.17.0`: expanded core
@@ -178,3 +178,98 @@ and TP=2 with prompt length 32, batch size two, one warmup, and two repetitions;
 JSON phase separation, memory scopes, rank completeness, and slowest-rank
 aggregation were checked. These runs establish harness behavior, not a performance
 baseline.
+
+
+## AutoRound INT4 eager path
+
+Existing model-path loading automatically recognizes `auto-round` / `auto_round`,
+`packing_format: auto_round:auto_gptq` (with legacy `format`/`backend` aliases), four bits, group size 128, symmetric quantization,
+and no activation order mapping. Only individual routed expert projections are
+packed; dense/attention tensors must be BF16 and routers FP32. `g_idx`, activation
+quantization, other formats (including Exl3), and FP32 quantized execution are rejected.
+
+```bash
+just run 0 .venv/bin/python tools/inspect_autoround.py /path/to/checkpoint --tp-size 2
+just run 0 .venv/bin/python tools/make_naive_fixture.py --output .cache/naive-int4-fixture --int4
+just run 1 .venv/bin/python tools/make_naive_fixture.py --output .cache/naive-int4-fixture --int4
+just naive-regression .cache/naive-int4-fixture
+```
+
+Inspection reads only safetensors headers and config/index JSON, validates the full
+expected tensor schema, and reports checkpoint payload bytes, each rank's resident
+weight bytes, a conservative temporary expert workspace reserve, and their sum.
+An index `total_size` of zero is treated as an exporter placeholder; payload sizes
+are computed from validated tensor headers. Nonzero index size mismatches are rejected.
+The peak weight estimate excludes KV cache, activations, driver/communication memory,
+and allocator overhead. The engine subtracts the reserve before allocating KV cache,
+and checks explicit page overrides against available memory.
+
+The loader preallocates final per-rank packed expert arrays and fills them from CPU
+safetensors slices; components may live in different shards. It retains INT32 words
+and FP16 scales. Gate/up and down projections shard output channels, preserving the
+existing BF16 gathers and output projection behavior. The eager backend reconstructs
+only the expert currently selected, uses FP16 scale multiplication before BF16
+conversion, and releases reconstructed matrices after their GEMMs. There is no
+persistent decoded expert cache or converted checkpoint. Packing/inspection live
+separately from the eager execution operator so future formats/backends can adapt
+without changing routing or accumulation.
+
+The synthetic fixture uses an independent encoder and reference decoder in
+`tools/autoround_reference.py`. Its supervised regression automatically selects
+BF16 for quantized fixtures, retaining TP=1/TP=2 prefill, chunked prefill, cached
+decode, multiple requests, API generation, and the unquantized Qwen smoke check.
+
+After the same trained checkpoint is staged on both Sparks, compare sampled real
+projections (choose multiple layers/experts and all three projection types):
+
+```bash
+just run 0 .venv/bin/python tools/check_autoround_projection.py /path/to/checkpoint --layer 1 --expert 0 --projection gate_proj --rank 0
+just run 1 .venv/bin/python tools/check_autoround_projection.py /path/to/checkpoint --layer 1 --expert 0 --projection down_proj --rank 1
+just serve-two /path/to/checkpoint --dtype bfloat16 --max-running-requests 1 --max-seq-len-override 4096
+```
+
+Record
+both ranks' loading seconds, resident tensor bytes, peak loading allocation (logged
+by the engine), peak generation memory, and deterministic generated token IDs.
+The projection helper retains one full reference projection solely for validation;
+its memory result describes that check, not runtime memory. Full-model qualification
+remains **pending** until trained projection checks, TP=2 startup, and deterministic
+generation pass. Model transfer and storage cleanup are outside this workflow.
+
+
+INT4 fixture validation on both NVIDIA GB10 Sparks (2026-10-01, PyTorch
+`2.9.1+cu130`, CUDA `13.0`, Transformers `5.17.0`) passed 155 core/supervisor tests,
+BF16 TP=1/TP=2 reference parity, both API serving checks, and the Qwen smoke check.
+Maximum reference logit error was `0.0078125`, maximum relative L2 `0.002001`,
+and greedy tokens matched at TP=1 and on both TP=2 ranks. The independent reference
+and native implementation both showed a `0.09619140625` full-vs-chunked prefill
+logit difference for one synthetic history. Quantized placement checks therefore
+hold chunk shapes fixed; every prefill/decode workload still compares against the
+independent reference with the original tolerances. Existing unquantized
+cross-chunk checks remain in place. Fixture parity does not promise chunk-size
+invariant BF16 generation.
+
+The fixture header report at TP=2 was 169,128,592 checkpoint bytes, 85,705,352
+resident weight bytes per rank, and a 1,310,720-byte expert workspace reserve.
+The sampled fixture gate projection qualification command reconstructed weights
+exactly and produced zero projection error. These are synthetic implementation
+checks; trained-weight qualification is still pending.
+
+The final unquantized regression also passed all 155 tests, FP32/BF16 parity at
+TP=1/TP=2, both Naive API checks, and Qwen serving smoke on the same Sparks.
+Local validation records are in
+`.cache/naive-int4-results/20261001-181616-080880db/results.json` and
+`.cache/naive-int4-unquantized-results/20261001-181917-b02927bd/results.json`.
+
+With the real checkpoint staged at `~/models/Naive-N0.5-Flash-Int4` on both Sparks,
+header validation passed on both hosts after recognizing AutoRound's canonical
+`packing_format` field and its zero-valued index size placeholder. Validated payload
+size was 169,538,945,408 bytes, with 84,949,268,416 resident weight bytes per rank
+and a 167,772,160-byte expert workspace reserve. Regression tests cover both metadata
+cases; incorrect nonzero index sizes remain rejected.
+
+The user subsequently reported successful TP=2 startup and streamed generation from
+the real checkpoint through `/generate` and `/v1/chat/completions`. The chat smoke
+answered "Paris." and terminated with `finish_reason: stop`. These establish basic
+trained-model API serving, but sampled trained expert comparisons, recorded full-model
+loading/peak-memory measurements, and broader correctness qualification remain pending.

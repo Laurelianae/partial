@@ -51,6 +51,8 @@ def main() -> None:
     max_error = 0.0
     max_relative_l2 = 0.0
     reference_caches = []
+    last_reference = None
+    chunk_shape_errors = None
     reference_features = {}
     for name, module in reference.named_modules():
         if name.endswith(("input_layernorm", "post_attention_layernorm", "self_attn", "mlp")):
@@ -82,7 +84,7 @@ def main() -> None:
                 states = states + attn + mlp
 
     def run(prompts, chunks, cached_prefix=0, location_offset=0, fragmented=False):
-        nonlocal max_error, max_relative_l2, reference_caches
+        nonlocal max_error, max_relative_l2, reference_caches, last_reference
         if cached_prefix == 0:
             reference_caches = [None] * len(prompts)
         offset = location_offset
@@ -162,6 +164,7 @@ def main() -> None:
                 raise
             assert torch.equal(actual.argmax(-1), wanted.argmax(-1)), "Greedy token IDs differ"
             last = actual
+            last_reference = wanted
         return last
 
     def check_components():
@@ -245,11 +248,33 @@ def main() -> None:
         if dtype == torch.float32:
             torch.testing.assert_close(reused.float(), relocated.float(), atol=2e-5, rtol=2e-5)
         fresh = run([continuation], [132])
+        fresh_reference = last_reference
+        # Cache placement parity uses the same GEMM/chunk shapes. Quantized BF16
+        # reference execution can itself change with the chunk shape.
+        chunked_placement = run([continuation], [13] * 11)
         fragmented = run([continuation], [13] * 11, fragmented=True)
         tolerance = 2e-5 if dtype == torch.float32 else 0.025
         torch.testing.assert_close(
-            fresh.float(), fragmented.float(), atol=tolerance, rtol=tolerance
+            chunked_placement.float(), fragmented.float(), atol=tolerance, rtol=tolerance
         )
+        if getattr(reference.config, "quantization_config", None):
+            native_delta = fresh.float() - fragmented.float()
+            reference_delta = fresh_reference.float() - last_reference.float()
+            torch.testing.assert_close(
+                native_delta, reference_delta, atol=tolerance, rtol=tolerance
+            )
+            chunk_shape_errors = {
+                "native": native_delta.abs().max().item(),
+                "reference": reference_delta.abs().max().item(),
+            }
+            print(
+                f"rank={args.node_rank}: chunk-shape logit differences {chunk_shape_errors}",
+                flush=True,
+            )
+        else:
+            torch.testing.assert_close(
+                fresh.float(), fragmented.float(), atol=tolerance, rtol=tolerance
+            )
         # Cached greedy generation, using identical histories in both implementations.
         prompt = [100, 101, 102, 103, 104]
         greedy = []
@@ -281,6 +306,7 @@ def main() -> None:
                 "max_logit_error": max_error,
                 "max_relative_l2": max_relative_l2,
                 "generated_token_ids": greedy,
+                "chunk_shape_logit_errors": chunk_shape_errors,
             }
         )
     finally:

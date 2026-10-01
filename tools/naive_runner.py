@@ -203,7 +203,11 @@ def main() -> None:
             ],
         )
         for tp in ((1,) if args.quick else (1, 2)):
-            for dtype in (("bfloat16",) if args.quick else ("float32", "bfloat16")):
+            for dtype in (
+                ("bfloat16",)
+                if args.quick or identities[0].get("quantized")
+                else ("float32", "bfloat16")
+            ):
                 parity_args = ["--dtype", dtype]
                 if not args.quick:
                     parity_args += ["--production-top-k", "--page-size", "4"]

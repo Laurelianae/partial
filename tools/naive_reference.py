@@ -35,5 +35,10 @@ def load_reference(folder: Path, dtype, device):
     for layer in model.model.layers:
         if hasattr(layer.mlp, "gate"):
             layer.mlp.gate.float()
-    model.load_state_dict(load_file(str(folder / "model.safetensors"), device=str(device)))
+    tensors = load_file(str(folder / "model.safetensors"), device=str(device))
+    if getattr(config, "quantization_config", None):
+        from autoround_reference import reconstruct_experts
+
+        tensors = reconstruct_experts(tensors)
+    model.load_state_dict(tensors)
     return model.eval()

@@ -14,6 +14,7 @@ from minisgl.layers import (
 )
 from minisgl.utils import div_even
 
+from .autoround import GPTQProjection, validate_quantization
 from .base import BaseLLMModel
 from .config import ModelConfig
 from .naive_config import NaiveN05FlashConfig
@@ -246,9 +247,52 @@ class NaiveExperts(BaseOP):
         return result
 
 
+class NaivePackedExperts(BaseOP):
+    """Eager backend: reconstruct only the expert being evaluated."""
+
+    def __init__(self, c: NaiveN05FlashConfig) -> None:
+        if torch.get_default_dtype() != torch.bfloat16:
+            raise ValueError("AutoRound Naive inference requires bfloat16")
+        size = get_tp_info().size
+        if c.moe_intermediate_size % (8 * size) or c.hidden_size % (8 * size):
+            raise ValueError("AutoRound TP output shards must align to eight channels")
+        width = div_even(c.moe_intermediate_size, size)
+        self.gate_proj = GPTQProjection(c.n_routed_experts, c.hidden_size, width)
+        self.up_proj = GPTQProjection(c.n_routed_experts, c.hidden_size, width)
+        self.down_proj = GPTQProjection(
+            c.n_routed_experts, c.moe_intermediate_size, div_even(c.hidden_size, size)
+        )
+        self._comm = DistributedCommunicator()
+        self._num_experts = c.n_routed_experts
+
+    def forward(self, states, selected, weights):
+        result = torch.zeros_like(states)
+        for expert in range(self._num_experts):
+            slot, token = torch.where(selected.T == expert)
+            if token.numel() == 0:
+                continue
+            # Retain the fused gate/up GEMM shape of the unquantized reference.
+            gate_weight = self.gate_proj.forward(expert)
+            up_weight = self.up_proj.forward(expert)
+            gate_up_weight = torch.cat((gate_weight, up_weight))
+            del gate_weight, up_weight
+            gate_up = F.linear(states[token], gate_up_weight)
+            del gate_up_weight
+            gate, up = gate_up.chunk(2, dim=-1)
+            activated = gather_last_dim(F.silu(gate) * up, self._comm)
+            down_weight = self.down_proj.forward(expert)
+            out = output_shard_linear(activated, down_weight)
+            del down_weight
+            out = gather_last_dim(out, self._comm)
+            out = (out * weights[token, slot, None]).to(states.dtype)
+            result.index_add_(0, token, out)
+        return result
+
+
 class NaiveMoE(BaseOP):
     def __init__(self, c: NaiveN05FlashConfig) -> None:
-        self.gate, self.experts = NaiveRouter(c), NaiveExperts(c)
+        self.gate = NaiveRouter(c)
+        self.experts = NaivePackedExperts(c) if validate_quantization(c) else NaiveExperts(c)
 
     def forward(self, states: torch.Tensor) -> torch.Tensor:
         selected, weights = self.gate.forward(states)
