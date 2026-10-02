@@ -6,16 +6,19 @@ import torch
 from minisgl.core import Batch, get_global_ctx
 from minisgl.kvcache.naive_pool import NaiveKVCache
 from minisgl.models.config import ModelConfig
+from minisgl.profiling import region, traced
 
 from .base import BaseAttnBackend, BaseAttnMetadata
 
 
+@traced("sparse_selection")
 def sparse_mask(scores: torch.Tensor, allowed: torch.Tensor, top_k: int) -> torch.Tensor:
     scores = scores.masked_fill(~allowed, -torch.inf)
     selected = scores.argsort(dim=-1, descending=True, stable=True)[..., :top_k]
     return allowed & torch.zeros_like(allowed).scatter(-1, selected, True)
 
 
+@traced("attention_compute")
 def attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -102,10 +105,11 @@ class NaiveAttentionBackend(BaseAttnBackend):
                     allowed &= distance < c.sliding_window
                 else:
                     assert index_query is not None and index_weights is not None
-                    ik = self.cache.index_cache(layer_id)[loc]
-                    scores = (index_query[sl].transpose(0, 1).float() @ ik.float().T).relu()
-                    scores = (scores * index_weights[sl].T.unsqueeze(-1).float()).sum(0)
-                    allowed = sparse_mask(scores, allowed, c.index_top_k)
+                    with region("indexer_scores"):
+                        ik = self.cache.index_cache(layer_id)[loc]
+                        scores = (index_query[sl].transpose(0, 1).float() @ ik.float().T).relu()
+                        scores = (scores * index_weights[sl].T.unsqueeze(-1).float()).sum(0)
+                        allowed = sparse_mask(scores, allowed, c.index_top_k)
                 out = attention(
                     q[sl].transpose(0, 1), keys, values, allowed, c.attention_value_scale, sink
                 )

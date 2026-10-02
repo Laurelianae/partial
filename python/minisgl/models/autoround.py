@@ -13,6 +13,7 @@ from pathlib import Path
 
 import torch
 from minisgl.layers import BaseOP
+from minisgl.profiling import traced
 
 EXPERT = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
@@ -61,6 +62,7 @@ def projection_shapes(inputs: int, outputs: int) -> dict[str, tuple[int, int]]:
     }
 
 
+@traced("int4_reconstruct")
 def dequantize(qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """GPTQ input-major packing, zero + 1, and FP16 multiply before BF16 cast."""
     shifts = torch.arange(8, device=qweight.device, dtype=torch.int32) * 4

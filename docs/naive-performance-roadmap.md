@@ -35,11 +35,11 @@ Existing fixture timings do not establish production performance. See
 
 ## 2. Identify the dominant costs
 
-- [ ] Profile INT4 weight reconstruction, expert GEMMs and dispatch, TP
+- [x] Profile INT4 weight reconstruction, expert GEMMs and dispatch, TP
   communication, attention/indexing, and CPU overhead.
-- [ ] Inspect both ranks for communication waits and imbalance; distinguish
+- [x] Inspect both ranks for communication waits and imbalance; distinguish
   prompt-processing costs from decode costs.
-- [ ] Rank optimization candidates by their measured contribution and save the
+- [x] Rank optimization candidates by their measured contribution and save the
   traces supporting the first choice.
 
 **Initial hypothesis:** Eager INT4 MoE execution is the leading candidate. It
@@ -52,6 +52,12 @@ and attention that sorts scores and computes over the full history despite a
 sparse or sliding-window mask.
 
 **Complete when:** Saved traces support a specific first optimization.
+
+Completed on 2026-10-02: [profiling findings](naive-profile-findings.md) record
+24 validated CPU/CUDA traces and a matching unprofiled control. INT4
+reconstruction was the largest GPU category in every trace. First optimize packed
+expert execution to avoid full BF16 reconstruction; reassess dispatch and
+synchronization next. Profiling overhead and rank imbalance are recorded explicitly.
 
 ## 3. Implement and validate one target-model improvement
 
@@ -98,12 +104,14 @@ than committing to a draft architecture before inspecting its repository.
 
 ## Results log
 
-Step 1 has a compact production baseline. Profiling and optimization remain
-pending. Keep measured findings separate from hypotheses and link to detailed
-artifacts, including interrupted or unsuccessful attempts.
+Steps 1 and 2 have a compact production baseline and measured cost attribution.
+Target-model optimization remains pending. Keep measured findings separate from
+hypotheses and link to detailed artifacts, including interrupted or unsuccessful
+attempts.
 
 | Date | Step | Source revision / working-tree changes | Workload | Commands / artifacts | Findings | Next action |
 | --- | --- | --- | --- | --- | --- | --- |
 | 2026-10-02 | 1: preliminary attempt | `3726ddf` + saved baseline source snapshot | Initial prompt suite | `.cache/naive-baseline/20261002-180152-c3640927/` | Stopped before token samples to extend retrieval beyond the sparse-selection limit | Use finalized prompts |
 | 2026-10-02 | 1: longer attempt | `3726ddf` + saved baseline source snapshot | 127-token assistant, 128 output tokens | `.cache/naive-baseline/20261002-180616-9344a043/` | One measured request: 0.937 decode tokens/s; stopped at user request to shorten suite | Run compact suite |
 | 2026-10-02 | 1: compact baseline complete | `3726ddf` + saved baseline source snapshot | TP=2; prompts 127/248/2,172 tokens; 32 output tokens; one warmup + two repetitions | `just naive-baseline`; [findings and artifacts](naive-baseline-findings.md) | Median TTFT 13.520/17.884/24.144 s; decode 0.942/0.936/0.919 tokens/s; rank token agreement and repeatability passed | Step 2: attribute costs with profiling |
+| 2026-10-02 | 2: profiling complete | `2b00e20` + saved profiling source snapshot | Same compact TP=2 workload; prefill and decode steps 8–11 on both ranks | `just naive-baseline`; `just naive-profile`; [findings and artifacts](naive-profile-findings.md) | 24 valid traces; identical tokens/SSE; reconstruction largest GPU category in every trace; median GPU shares 61–76% prefill and 60–64% decode | Step 3: avoid full BF16 expert reconstruction with validated packed INT4 execution |

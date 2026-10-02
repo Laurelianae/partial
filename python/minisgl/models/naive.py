@@ -12,6 +12,7 @@ from minisgl.layers import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from minisgl.profiling import region, traced
 from minisgl.utils import div_even
 
 from .autoround import GPTQProjection, validate_quantization
@@ -56,6 +57,7 @@ class NaiveLayerNorm(BaseOP):
         return F.layer_norm(x, (x.shape[-1],), self.weight, self.bias, 1e-5)
 
 
+@traced("tp_gather")
 def gather_last_dim(x: torch.Tensor, comm: DistributedCommunicator) -> torch.Tensor:
     size = get_tp_info().size
     if size == 1:
@@ -64,6 +66,7 @@ def gather_last_dim(x: torch.Tensor, comm: DistributedCommunicator) -> torch.Ten
     return gathered.transpose(0, 1).reshape(x.shape[0], size * x.shape[1])
 
 
+@traced("output_projection")
 def output_shard_linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -120,6 +123,7 @@ class NaiveIndexer(BaseOP):
         self.weights_proj = LinearReplicated(c.hidden_size, c.index_n_heads, False)
         self._config = c
 
+    @traced("indexer_projection")
     def forward(
         self, states: torch.Tensor, positions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -155,6 +159,7 @@ class NaiveAttention(BaseOP):
         sink = c.add_swa_attention_sink_bias if prefix else c.add_full_attention_sink_bias
         self.attention_sink_bias = torch.empty(self._heads) if sink else None
 
+    @traced("attention")
     def forward(self, states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         pos = ctx.batch.positions
@@ -191,6 +196,7 @@ class NaiveRouter(BaseOP):
         self.e_score_correction_bias = torch.empty(c.n_routed_experts, dtype=torch.float32)
         self._config = c
 
+    @traced("router")
     def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         c = self._config
         scores = F.linear(states.float(), self.weight).sigmoid()
@@ -227,7 +233,8 @@ class NaiveExperts(BaseOP):
         result = torch.zeros_like(states)
         for expert in range(self.gate_up_proj.shape[0]):
             # Match the reference's slot-major token ordering for BF16 GEMMs.
-            slot, token = torch.where(selected.T == expert)
+            with region("expert_dispatch"):
+                slot, token = torch.where(selected.T == expert)
             if token.numel() == 0:
                 continue
             gate_up = F.linear(states[token], self.gate_up_proj[expert])
@@ -242,8 +249,9 @@ class NaiveExperts(BaseOP):
                 out = F.linear(activated, self.down_proj[expert])
                 if get_tp_info().size > 1:
                     out = self._comm.all_reduce(out)
-            out = (out * weights[token, slot, None]).to(states.dtype)
-            result.index_add_(0, token, out)
+            with region("expert_accumulate"):
+                out = (out * weights[token, slot, None]).to(states.dtype)
+                result.index_add_(0, token, out)
         return result
 
 
@@ -265,18 +273,22 @@ class NaivePackedExperts(BaseOP):
         self._comm = DistributedCommunicator()
         self._num_experts = c.n_routed_experts
 
+    @traced("experts")
     def forward(self, states, selected, weights):
         result = torch.zeros_like(states)
         for expert in range(self._num_experts):
-            slot, token = torch.where(selected.T == expert)
+            with region("expert_dispatch"):
+                slot, token = torch.where(selected.T == expert)
             if token.numel() == 0:
                 continue
             # Retain the fused gate/up GEMM shape of the unquantized reference.
             gate_weight = self.gate_proj.forward(expert)
             up_weight = self.up_proj.forward(expert)
-            gate_up_weight = torch.cat((gate_weight, up_weight))
+            with region("weight_concat"):
+                gate_up_weight = torch.cat((gate_weight, up_weight))
             del gate_weight, up_weight
-            gate_up = F.linear(states[token], gate_up_weight)
+            with region("expert_gate_up_gemm"):
+                gate_up = F.linear(states[token], gate_up_weight)
             del gate_up_weight
             gate, up = gate_up.chunk(2, dim=-1)
             activated = gather_last_dim(F.silu(gate) * up, self._comm)
@@ -284,8 +296,9 @@ class NaivePackedExperts(BaseOP):
             out = output_shard_linear(activated, down_weight)
             del down_weight
             out = gather_last_dim(out, self._comm)
-            out = (out * weights[token, slot, None]).to(states.dtype)
-            result.index_add_(0, token, out)
+            with region("expert_accumulate"):
+                out = (out * weights[token, slot, None]).to(states.dtype)
+                result.index_add_(0, token, out)
         return result
 
 
@@ -319,8 +332,9 @@ class NaiveModel(BaseOP):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         states = self.embed_tokens.forward(input_ids)
-        for layer in self.layers.op_list:
-            states = layer.forward(states)
+        for index, layer in enumerate(self.layers.op_list):
+            with region(f"layer/{index}"):
+                states = layer.forward(states)
         return self.norm.forward(states)
 
 

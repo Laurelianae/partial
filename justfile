@@ -79,3 +79,7 @@ naive-chunk-stability model *args: sync-all
 # Compact real-model streaming API baseline (TP=2, one session).
 naive-baseline model="~/models/Naive-N0.5-Flash-Int4" *args: sync-all
     @python3 tools/naive_baseline.py "$1" "${@:2}"
+
+# Capture prefill and decode steps 8-11 on both ranks of the compact API suite.
+naive-profile model="~/models/Naive-N0.5-Flash-Int4" *args: sync-all
+    @python3 tools/naive_baseline.py "$1" --profile "${@:2}"

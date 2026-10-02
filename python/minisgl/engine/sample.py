@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
 import torch
+from minisgl.profiling import traced
 from minisgl.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
@@ -68,6 +69,7 @@ class Sampler:
         return BatchSamplingArgs(temperatures, top_k=top_k, top_p=top_p)
 
     @nvtx_annotate("Sampler")
+    @traced("sampling")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
             if args.temperatures is None:  # greedy sampling

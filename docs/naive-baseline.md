@@ -1,6 +1,7 @@
 # Naive production baseline
 
-See the [first compact baseline results](naive-baseline-findings.md).
+See the [first compact baseline results](naive-baseline-findings.md) and
+[subsequent cost profiling](naive-profile-findings.md).
 
 Run the trained INT4 checkpoint on both Sparks with one request at a time:
 

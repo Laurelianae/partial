@@ -99,9 +99,14 @@ def main() -> None:
     parser.add_argument("--startup-timeout", type=float, default=1800)
     parser.add_argument("--without-telemetry", action="store_true")
     parser.add_argument("--fixture", action="store_true")
+    parser.add_argument("--profile-dir")
     args = parser.parse_args()
     if args.tokens < 2 or args.repeat < 1 or args.warmup < 0:
         parser.error("Need >=2 tokens, >=1 repetition and >=0 warmups")
+    if args.profile_dir and (args.without_telemetry or args.tokens < 13):
+        parser.error(
+            "Profiling requires telemetry and at least 13 output tokens (one after trace export)"
+        )
     model = str(Path(args.model).expanduser())
     url = f"http://127.0.0.1:{args.port}"
     if args.node_rank == 0:
@@ -142,6 +147,14 @@ def main() -> None:
         server_args.extend(["--dist-init-addr", args.dist_init_addr])
     environment = os.environ.copy()
     environment["MINISGL_BASELINE_TELEMETRY"] = "0" if args.without_telemetry else "1"
+    for name in ("MINISGL_PROFILE_DIR", "MINISGL_PROFILE_WARMUP", "MINISGL_PROFILE_REPEAT"):
+        environment.pop(name, None)
+    if args.profile_dir:
+        environment.update(
+            MINISGL_PROFILE_DIR=args.profile_dir,
+            MINISGL_PROFILE_WARMUP=str(args.warmup),
+            MINISGL_PROFILE_REPEAT=str(args.repeat),
+        )
     process = subprocess.Popen(
         [sys.executable, "tools/serve_worker.py", "--watch-stdin", *server_args],
         stdin=subprocess.PIPE,

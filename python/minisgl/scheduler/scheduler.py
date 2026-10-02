@@ -13,6 +13,7 @@ from minisgl.message import (
     ExitMsg,
     UserMsg,
 )
+from minisgl.profiling import RequestProfiler, region, traced
 from minisgl.utils import init_logger, load_tokenizer
 
 from .cache import CacheManager
@@ -81,6 +82,12 @@ class Scheduler(SchedulerIOMixin):
             self.baseline_telemetry = BaselineTelemetry(config.tp_info.rank)
             self.baseline_telemetry.runtime(config, self.engine)
 
+        self.request_profiler = RequestProfiler.from_env(config.tp_info.rank)
+        if self.request_profiler is not None:
+            if self.baseline_telemetry is None:
+                raise ValueError("Profiling requires baseline telemetry")
+            self.request_profiler.prime()
+
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
 
@@ -119,12 +126,17 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
-        forward_input = self._schedule_next_batch()
-        ongoing_data = None
-        if forward_input is not None:
-            ongoing_data = (forward_input, self._forward(forward_input))
-
-        self._process_last_data(ongoing_data)
+        profiler = self.request_profiler
+        if profiler is not None:
+            profiler.before_step()
+        with region(f"step/{profiler.step}" if profiler is not None else "step"):
+            forward_input = self._schedule_next_batch()
+            ongoing_data = None
+            if forward_input is not None:
+                ongoing_data = (forward_input, self._forward(forward_input))
+            self._process_last_data(ongoing_data)
+        if profiler is not None and ongoing_data is not None:
+            profiler.after_step(bool(self.finished_reqs))
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
@@ -140,10 +152,13 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
+        if self.request_profiler is not None:
+            self.request_profiler.abort()
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
 
+    @traced("token_completion")
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
             return
@@ -201,8 +216,12 @@ class Scheduler(SchedulerIOMixin):
                 )
             if self.baseline_telemetry is not None:
                 self.baseline_telemetry.begin(msg)
+            if self.request_profiler is not None:
+                self.request_profiler.begin(msg.uid)
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
+            if self.request_profiler is not None and self.request_profiler.uid == msg.uid:
+                self.request_profiler.abort()
             if self.baseline_telemetry is not None:
                 record = self.baseline_telemetry.record
                 if record is not None and record["uid"] == msg.uid:
@@ -235,6 +254,7 @@ class Scheduler(SchedulerIOMixin):
             write_tuple=write_mapping,
         )
 
+    @traced("schedule_prepare")
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
         batch = (

@@ -15,6 +15,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from chunk_stability_remote import preflight
+from naive_profile import collect_profiles
 from naive_results import emit
 from naive_runner import command, run_job
 
@@ -143,6 +144,7 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=28800)
     parser.add_argument("--request-timeout", type=float, default=1800)
     parser.add_argument("--without-telemetry", action="store_true")
+    parser.add_argument("--profile", action="store_true")
     parser.add_argument("--output", type=Path, default=Path(".cache/naive-baseline"))
     args = parser.parse_args()
     if args.preflight:
@@ -158,6 +160,12 @@ def main() -> None:
         parser.error("Invalid counts or timeouts")
     if not args.fixture and (args.tp_size != 2 or args.without_telemetry):
         parser.error("Production baseline requires TP=2 and telemetry")
+    if args.profile and (args.without_telemetry or args.tokens < 13):
+        parser.error(
+            "Profiling requires telemetry and at least 13 output tokens (one after trace export)"
+        )
+    if args.profile and args.output == Path(".cache/naive-baseline"):
+        args.output = Path(".cache/naive-profile")
     directory = args.output / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8])
     directory.mkdir(parents=True)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -234,13 +242,19 @@ def main() -> None:
         if args.without_telemetry:
             extra.append("--without-telemetry")
         for session in range(args.sessions):
+            remote_profile = f".cache/naive-profile/{directory.name}/session-{session}"
+            profile_args = ["--profile-dir", remote_profile] if args.profile else []
             records = job(
                 f"session-{session}",
                 [
                     command(
                         node,
                         "tools/naive_baseline_worker.py",
-                        extra if args.tp_size == 2 else ["--model", args.model, *extra],
+                        (
+                            [*extra, *profile_args]
+                            if args.tp_size == 2
+                            else ["--model", args.model, *extra, *profile_args]
+                        ),
                         args.model,
                         args.tp_size,
                     )
@@ -258,6 +272,16 @@ def main() -> None:
                     not args.without_telemetry,
                 )
             )
+            if args.profile:
+                report.setdefault("profiles", []).append(
+                    collect_profiles(
+                        records,
+                        args.tp_size,
+                        remote_profile,
+                        directory / f"session-{session}" / "traces",
+                        args.timeout,
+                    )
+                )
             save()
         report["status"] = "completed"
     except BaseException as exc:
