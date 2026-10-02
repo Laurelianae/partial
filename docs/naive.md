@@ -1,5 +1,8 @@
 # Naive-N0.5-Flash correctness milestone
 
+For the step-by-step optimization checklist and results log, see the
+[Naive performance roadmap](naive-performance-roadmap.md).
+
 The server recognizes `NaiveN05FlashForCausalLM` and executes its SWA/DSA attention,
 partial RoPE, attention sinks, FP8-rounded indexer, dense first layer, and sigmoid
 MoE router using eager PyTorch operations. Transformers is pinned to `5.17.0`.

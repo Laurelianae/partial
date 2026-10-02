@@ -263,7 +263,8 @@ def _load_autoround_weight(files, config, device):
     from .autoround import _DTYPES, EXPERT, inspect_checkpoint
 
     c = config.naive_config
-    rank, size = get_tp_info().rank, get_tp_info().size
+    tp_info = get_tp_info()
+    rank, size = tp_info.rank, tp_info.size
     if not files:
         raise ValueError("No AutoRound checkpoint shards found")
     report = inspect_checkpoint(Path(files[0]).parent, c, size)
@@ -283,35 +284,44 @@ def _load_autoround_weight(files, config, device):
             shape = (c.n_routed_experts, spec["shape"][0], spec["shape"][1] // size)
             buffers[key] = torch.empty(shape, dtype=_DTYPES[spec["dtype"]][0], device=device)
             remaining[key] = c.n_routed_experts
-    for file in sorted(files):
-        with safetensors.safe_open(file, framework="pt", device="cpu") as reader:
-            for name in reader.keys():
-                match = EXPERT.match(name)
-                if match:
-                    layer, expert, projection, component = match.groups()
-                    key = f"model.layers.{layer}.mlp.experts.{projection}.{component}"
-                    target = buffers[key][int(expert)]
-                    width = target.shape[1]
-                    sliced = reader.get_slice(name)[:, rank * width : (rank + 1) * width]
-                    target.copy_(sliced)
-                    del sliced, target
-                    remaining[key] -= 1
-                    if not remaining[key]:
-                        yield key, buffers.pop(key)
-                else:
-                    # Reuse established BF16 sharding for all non-expert tensors.
-                    tensor = reader.get_tensor(name)
-                    if name.endswith((".o_proj.weight", ".down_proj.weight")):
-                        tensor = tensor.chunk(size, dim=0)[rank]
-                    elif ".indexer." in name or ".mlp.gate." in name:
-                        pass
-                    elif name.endswith(".attention_sink_bias"):
-                        tensor = tensor.chunk(size)[rank]
+    with tqdm(
+        total=len(report["entries"]),
+        desc="Loading INT4 weights",
+        unit="tensor",
+        disable=not tp_info.is_primary(),
+    ) as pbar:
+        for file in sorted(files):
+            with safetensors.safe_open(file, framework="pt", device="cpu") as reader:
+                for name in reader.keys():
+                    match = EXPERT.match(name)
+                    if match:
+                        layer, expert, projection, component = match.groups()
+                        key = f"model.layers.{layer}.mlp.experts.{projection}.{component}"
+                        target = buffers[key][int(expert)]
+                        width = target.shape[1]
+                        sliced = reader.get_slice(name)[:, rank * width : (rank + 1) * width]
+                        target.copy_(sliced)
+                        del sliced, target
+                        remaining[key] -= 1
+                        pbar.update(1)
+                        if not remaining[key]:
+                            yield key, buffers.pop(key)
                     else:
-                        heads = c.num_key_value_heads
-                        if ".self_attn." in name:
-                            layer = int(name.split(".layers.")[1].split(".")[0])
-                            if c.hybrid_layer_pattern[layer]:
-                                heads = c.swa_num_key_value_heads
-                        tensor = _shard_tensor(name, tensor, rank, size, heads)
-                    yield name, tensor.contiguous().to(device=device)
+                        # Reuse established BF16 sharding for all non-expert tensors.
+                        tensor = reader.get_tensor(name)
+                        if name.endswith((".o_proj.weight", ".down_proj.weight")):
+                            tensor = tensor.chunk(size, dim=0)[rank]
+                        elif ".indexer." in name or ".mlp.gate." in name:
+                            pass
+                        elif name.endswith(".attention_sink_bias"):
+                            tensor = tensor.chunk(size)[rank]
+                        else:
+                            heads = c.num_key_value_heads
+                            if ".self_attn." in name:
+                                layer = int(name.split(".layers.")[1].split(".")[0])
+                                if c.hybrid_layer_pattern[layer]:
+                                    heads = c.swa_num_key_value_heads
+                            tensor = _shard_tensor(name, tensor, rank, size, heads)
+                        tensor = tensor.contiguous().to(device=device)
+                        pbar.update(1)
+                        yield name, tensor

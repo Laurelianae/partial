@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from minisgl.distributed import DistributedInfo
 from minisgl.models.autoround import (
     dense_shapes,
     dequantize,
@@ -151,7 +152,7 @@ def test_streaming_tp_reconstruction(tmp_path, monkeypatch, rank):
     files = [tmp_path / "a.safetensors", tmp_path / "b.safetensors"]
     for i, file in enumerate(files):
         save_file(dict(items[i::2]), str(file))
-    monkeypatch.setattr(loader, "get_tp_info", lambda: SimpleNamespace(rank=rank, size=2))
+    monkeypatch.setattr(loader, "get_tp_info", lambda: DistributedInfo(rank, 2))
     loaded = dict(
         _load_naive_weight(
             [str(f) for f in files],
