@@ -64,6 +64,9 @@ class EnvClassSingleton:
     SHELL_TOP_P = EnvFloat(1.0)
     SHELL_TEMPERATURE = EnvFloat(0.6)
 
+    # Opt-in, single-request production baseline diagnostics.
+    BASELINE_TELEMETRY = EnvBool(False)
+
     # backend runtime
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)

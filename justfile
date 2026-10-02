@@ -75,3 +75,7 @@ naive-measure fixture *args: sync-all
 # Diagnose chunk-dependent logits/greedy tokens across both Sparks, without serving changes.
 naive-chunk-stability model *args: sync-all
     @python3 tools/chunk_stability_remote.py "$1" "${@:2}"
+
+# Compact real-model streaming API baseline (TP=2, one session).
+naive-baseline model="~/models/Naive-N0.5-Flash-Int4" *args: sync-all
+    @python3 tools/naive_baseline.py "$1" "${@:2}"

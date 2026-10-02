@@ -72,6 +72,15 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
 
+        self.baseline_telemetry = None
+        if ENV.BASELINE_TELEMETRY:
+            if not self.engine.model_config.is_naive or config.max_running_req != 1:
+                raise ValueError("Baseline telemetry requires Naive and max_running_req=1")
+            from .telemetry import BaselineTelemetry
+
+            self.baseline_telemetry = BaselineTelemetry(config.tp_info.rank)
+            self.baseline_telemetry.runtime(config, self.engine)
+
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
 
@@ -150,6 +159,8 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+                if self.baseline_telemetry is not None:
+                    self.baseline_telemetry.token(req.uid, next_token)
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
@@ -165,6 +176,8 @@ class Scheduler(SchedulerIOMixin):
 
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
+        if self.baseline_telemetry is not None and any(r.finished for r in reply):
+            self.baseline_telemetry.finish()
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
@@ -186,8 +199,14 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if self.baseline_telemetry is not None:
+                self.baseline_telemetry.begin(msg)
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
+            if self.baseline_telemetry is not None:
+                record = self.baseline_telemetry.record
+                if record is not None and record["uid"] == msg.uid:
+                    self.baseline_telemetry.record = None
             logger.debug_rank0("Aborting request %d", msg.uid)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)

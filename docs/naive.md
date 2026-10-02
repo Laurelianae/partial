@@ -124,6 +124,9 @@ loading is implemented as described below; full trained-weight qualification is 
 
 ## Reproducible regression and measurement
 
+For sustained trained-model API measurements, use the [production baseline](naive-baseline.md).
+The diagnostic harness below retains its fixed-history semantics.
+
 With the same fixture installed on both Sparks:
 
 ```bash

@@ -11,17 +11,22 @@ tests on the remote machines through the repository's `just` recipes.
 
 ## 1. Establish a production baseline
 
-- [ ] Record checkpoint identity, source revision and working-tree changes,
+- [x] Record checkpoint identity, source revision and working-tree changes,
   software versions, hardware, and serving settings.
-- [ ] Choose and save representative prompts, token counts, generation settings,
+- [x] Choose and save representative prompts, token counts, generation settings,
   warmup, and repetition counts. Start with one request at TP=2.
-- [ ] Measure prompt processing and sustained autoregressive decoding separately.
-- [ ] Record time to first token, per-token decode latency, output tokens/second,
+- [x] Measure prompt processing and sustained autoregressive decoding separately.
+- [x] Record time to first token, per-token decode latency, output tokens/second,
   and peak memory on both ranks.
-- [ ] Save exact commands, workloads, raw samples, and result artifacts so later
+- [x] Save exact commands, workloads, raw samples, and result artifacts so later
   changes can be compared under the same conditions.
 
 **Complete when:** Repeated real-model runs provide a reproducible baseline.
+
+Completed on 2026-10-02 with the [compact baseline](naive-baseline-findings.md):
+one warmup and two measured 32-token requests per prompt at TP=2. This initial
+baseline does not establish tail latency or variation between server restarts.
+See the [reproduction instructions](naive-baseline.md).
 
 The existing `just naive-measure` harness is useful for diagnostics, but its
 repeated fixed-history forward passes are not sustained autoregressive decoding.
@@ -93,9 +98,12 @@ than committing to a draft architecture before inspecting its repository.
 
 ## Results log
 
-No roadmap measurements or optimizations have been completed yet. Add a row for
-each completed experiment or decision, including unsuccessful attempts. Keep
-measured findings separate from hypotheses and link to detailed artifacts.
+Step 1 has a compact production baseline. Profiling and optimization remain
+pending. Keep measured findings separate from hypotheses and link to detailed
+artifacts, including interrupted or unsuccessful attempts.
 
 | Date | Step | Source revision / working-tree changes | Workload | Commands / artifacts | Findings | Next action |
 | --- | --- | --- | --- | --- | --- | --- |
+| 2026-10-02 | 1: preliminary attempt | `3726ddf` + saved baseline source snapshot | Initial prompt suite | `.cache/naive-baseline/20261002-180152-c3640927/` | Stopped before token samples to extend retrieval beyond the sparse-selection limit | Use finalized prompts |
+| 2026-10-02 | 1: longer attempt | `3726ddf` + saved baseline source snapshot | 127-token assistant, 128 output tokens | `.cache/naive-baseline/20261002-180616-9344a043/` | One measured request: 0.937 decode tokens/s; stopped at user request to shorten suite | Run compact suite |
+| 2026-10-02 | 1: compact baseline complete | `3726ddf` + saved baseline source snapshot | TP=2; prompts 127/248/2,172 tokens; 32 output tokens; one warmup + two repetitions | `just naive-baseline`; [findings and artifacts](naive-baseline-findings.md) | Median TTFT 13.520/17.884/24.144 s; decode 0.942/0.936/0.919 tokens/s; rank token agreement and repeatability passed | Step 2: attribute costs with profiling |
