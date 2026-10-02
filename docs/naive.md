@@ -232,9 +232,10 @@ Record
 both ranks' loading seconds, resident tensor bytes, peak loading allocation (logged
 by the engine), peak generation memory, and deterministic generated token IDs.
 The projection helper retains one full reference projection solely for validation;
-its memory result describes that check, not runtime memory. Full-model qualification
-remains **pending** until trained projection checks, TP=2 startup, and deterministic
-generation pass. Model transfer and storage cleanup are outside this workflow.
+its memory result describes that check, not runtime memory. Sampled trained
+projection checks, TP=2 startup, and repeated deterministic generation have now
+passed; see the results below. These checks do not establish independent end-to-end
+trained-model parity. Model transfer and storage cleanup are outside this workflow.
 
 
 INT4 fixture validation on both NVIDIA GB10 Sparks (2026-10-01, PyTorch
@@ -253,7 +254,7 @@ The fixture header report at TP=2 was 169,128,592 checkpoint bytes, 85,705,352
 resident weight bytes per rank, and a 1,310,720-byte expert workspace reserve.
 The sampled fixture gate projection qualification command reconstructed weights
 exactly and produced zero projection error. These are synthetic implementation
-checks; trained-weight qualification is still pending.
+checks; the subsequent trained sample is recorded below.
 
 The final unquantized regression also passed all 155 tests, FP32/BF16 parity at
 TP=1/TP=2, both Naive API checks, and Qwen serving smoke on the same Sparks.
@@ -271,5 +272,20 @@ cases; incorrect nonzero index sizes remain rejected.
 The user subsequently reported successful TP=2 startup and streamed generation from
 the real checkpoint through `/generate` and `/v1/chat/completions`. The chat smoke
 answered "Paris." and terminated with `finish_reason: stop`. These establish basic
-trained-model API serving, but sampled trained expert comparisons, recorded full-model
-loading/peak-memory measurements, and broader correctness qualification remain pending.
+trained-model API serving. Subsequent trained runs recorded loading and memory
+diagnostics and bit-identical repeated full-prefill baselines in the
+[chunk investigation](chunk-stability-findings.md).
+
+On 2026-10-02, all 36 sampled trained expert projection checks passed: layers
+1, 24, and 47; experts 0 and 255; gate/up/down projections; both TP=2 output shards.
+Reconstructed weights matched the independent decoder exactly, and every measured
+projection error was zero. The supervised run took 297.46 seconds including full
+checkpoint hashing. See [the projection validation report](naive-projection-findings.md)
+for commands, artifacts, timings, and coverage limits. Independent end-to-end
+trained-model reference parity and broader correctness qualification remain pending.
+
+For a focused trained-model comparison of full prefill with chunks of 13, 64,
+and 128, see [the chunk-size investigation](chunk-stability.md). Its standalone
+TP=2 harness records fixed token histories, baseline repeats, forced-history logits,
+independent greedy generation, aligned operation traces, and component FP32 replays
+without changing serving behavior or parity tolerances.

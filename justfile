@@ -71,3 +71,7 @@ naive-regression fixture *args: sync-all
 # Native-only prefill/decode measurement, with --tp-size 1 or 2.
 naive-measure fixture *args: sync-all
     @python3 tools/naive_runner.py measure "$1" "${@:2}"
+
+# Diagnose chunk-dependent logits/greedy tokens across both Sparks, without serving changes.
+naive-chunk-stability model *args: sync-all
+    @python3 tools/chunk_stability_remote.py "$1" "${@:2}"
